@@ -45,6 +45,40 @@ jobs:
 
       - name: Pin idna_adapter to use unicode-rs backend
         run: cargo update -p idna_adapter --precise 1.1.0
+      
+      - name: Downgrade incompatible dependencies
+        shell: pwsh
+        run: |
+          # 循环尝试构建，直到成功或无法自动修复
+          $maxAttempts = 10
+          for ($i = 1; $i -le $maxAttempts; $i++) {
+            $output = cargo build --release 2>&1
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "构建成功！"
+              break
+            }
+            
+            # 从错误信息中提取需要降级的 crate 名称
+            $match = [regex]::Match($output, 'failed to parse manifest at `.*?([^\\/]+)-[\d.]+\\Cargo\.toml`')
+            if (-not $match.Success) {
+              # 如果不是 edition2024 类型的错误，直接退出循环，让后续步骤报错
+              Write-Host "遇到非 Edition 2024 错误，停止自动降级。"
+              $output | Write-Host
+              exit 1
+            }
+            
+            $crateName = $match.Groups[1].Value
+            Write-Host "检测到不兼容依赖: $crateName，尝试降级..."
+            
+            # 这里需要你根据具体情况，为每个 crate 指定一个已知兼容的版本
+            # 例如对于 zeroize，我们用 1.8.1
+            if ($crateName -eq "zeroize") {
+              cargo update -p $crateName --precise 1.8.1
+            } else {
+              Write-Host "没有为 $crateName 预设兼容版本，无法自动修复。"
+              exit 1
+            }
+          }
 
       - name: Build (GNU target, release)
         run: cargo build --release
