@@ -1,0 +1,27 @@
+name: Build for Windows 10/11
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-win10-11:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        # 默认 target 即 x86_64-pc-windows-msvc，无需显式指定
+
+      - name: Build (MSVC, release)
+        run: cargo build --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: win10-11-msvc-release
+          path: target/release/*.exe
