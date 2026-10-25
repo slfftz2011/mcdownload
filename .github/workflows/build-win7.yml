@@ -43,13 +43,12 @@ jobs:
         run: |
           "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Pin idna_adapter to use unicode-rs backend
-        run: cargo update -p idna_adapter --precise 1.1.0
-
-      - name: Pin QUIC dependencies
+      - name: Pin dependencies
         run: |
+          cargo update -p idna_adapter --precise 1.1.0
           cargo update -p quinn --precise 0.11.8 || true
           cargo update -p quinn-proto --precise 0.11.14 || true
+          cargo update -p hyper-util --precise 0.1.20
       
       - name: Downgrade incompatible dependencies
         shell: pwsh
