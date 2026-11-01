@@ -4,12 +4,6 @@ use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use mirror::MirrorConfig;
 
-let mirror = MirrorConfig::default();
-
-mirror.rewrite_version_manifest(&mut manifest_json)?;
-
-let final_url = mirror.rewrite(&original_url);
-downloader::download(&final_url, &dest, expected).await?;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -19,6 +13,12 @@ async fn main() -> Result<()> {
     let mut out: Option<String> = None;
     let mut sha1_hex: Option<String> = None;
     let mut sha256_hex: Option<String> = None;
+    let mirror = MirrorConfig::default();
+    
+    mirror.rewrite_version_manifest(&mut manifest_json)?;
+    
+    let final_url = mirror.rewrite(&original_url);
+    downloader::download(&final_url, &dest, expected).await?;
 
     let mut i = 0;
     while i < args.len() {
