@@ -2,6 +2,14 @@ mod downloader;
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
+use mirror::MirrorConfig;
+
+let mirror = MirrorConfig::default();
+
+mirror.rewrite_version_manifest(&mut manifest_json)?;
+
+let final_url = mirror.rewrite(&original_url);
+downloader::download(&final_url, &dest, expected).await?;
 
 #[tokio::main]
 async fn main() -> Result<()> {
