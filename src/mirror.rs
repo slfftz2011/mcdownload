@@ -2,7 +2,6 @@ use anyhow::Result;
 
 #[derive(Clone, Debug)]
 pub struct MirrorConfig {
-    /// 是否启用镜像；关掉就全部走官方源
     pub enabled: bool,
     pub version_manifest: String,
     pub maven: String,
@@ -25,7 +24,6 @@ impl Default for MirrorConfig {
 }
 
 impl MirrorConfig {
-    /// 关掉镜像，走官方源
     pub fn official() -> Self {
         Self {
             enabled: false,
@@ -37,7 +35,6 @@ impl MirrorConfig {
         }
     }
 
-    /// 把任意官方 URL 重写成镜像 URL；已关闭镜像或没有匹配规则时原样返回
     pub fn rewrite(&self, url: &str) -> String {
         if !self.enabled {
             return url.to_string();
@@ -48,11 +45,11 @@ impl MirrorConfig {
             .replace("https://resources.download.minecraft.net", &self.assets)
     }
 
-    /// 解析 version_manifest 后，直接把每个版本的 `url` 重写好
     pub fn rewrite_version_manifest(&self, manifest: &mut serde_json::Value) -> Result<()> {
         if let Some(versions) = manifest.get_mut("versions").and_then(|v| v.as_array_mut()) {
             for v in versions {
-                if let Some(url) = v.get("url").and_then(|u| u.as_str()).map(str::to_string) {
+                // 关键改动：用闭包替代 str::to_string，让编译器知道收到的是 &str
+                if let Some(url) = v.get("url").and_then(|u| u.as_str()).map(|s| s.to_string()) {
                     let rewritten = self.rewrite(&url);
                     v["url"] = serde_json::Value::String(rewritten);
                 }
