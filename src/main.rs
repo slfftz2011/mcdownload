@@ -1,9 +1,9 @@
 mod downloader;
+mod mirror;
 
 use anyhow::{bail, Context, Result};
-use std::path::PathBuf;
 use mirror::MirrorConfig;
-
+use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -13,12 +13,6 @@ async fn main() -> Result<()> {
     let mut out: Option<String> = None;
     let mut sha1_hex: Option<String> = None;
     let mut sha256_hex: Option<String> = None;
-    let mirror = MirrorConfig::default();
-    
-    mirror.rewrite_version_manifest(&mut manifest_json)?;
-    
-    let final_url = mirror.rewrite(&original_url);
-    downloader::download(&final_url, &dest, expected).await?;
 
     let mut i = 0;
     while i < args.len() {
@@ -93,13 +87,17 @@ async fn main() -> Result<()> {
         })
     };
 
-    println!("下载: {}", url);
+    // 关键：下载前把官方地址重写成镜像地址
+    let mirror = MirrorConfig::default();
+    let final_url = mirror.rewrite(&url);
+
+    println!("下载: {}", final_url);
     println!("保存至: {}", dest.display());
-    if let Some(exp) = expected {
+    if let Some(exp) = &expected {
         println!("校验: {:?} {}", exp.algo, exp.hex);
     }
 
-    downloader::download(&url, &dest, expected).await?;
+    downloader::download(&final_url, &dest, expected).await?;
 
     let size = tokio::fs::metadata(&dest).await?.len();
     println!("完成: {} ({})", dest.display(), human_size(size));
