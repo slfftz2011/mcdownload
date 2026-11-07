@@ -137,7 +137,6 @@ impl Downloader {
             if existing > 0 {
                 if !announced && !self.quiet {
                     eprintln!("续传 {} ({} 字节)", dest.display(), existing);
-                    announced = true;
                 }
                 req = req.header(reqwest::header::RANGE, format!("bytes={}-", existing));
             }

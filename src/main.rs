@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
     };
 
     match cmd {
-        "url" => cmd_url(positional, &mirror).await,
+        "url" => cmd_url(positional, &flags).await,
         "manifest" => cmd_manifest(&mirror, &flags).await,
         "install" => cmd_install(positional, &mirror, &flags).await,
         _ => unreachable!(),
