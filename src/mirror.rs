@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde_json::Value;
 
 #[derive(Clone, Debug)]
 pub struct MirrorConfig {
@@ -45,13 +46,15 @@ impl MirrorConfig {
             .replace("https://resources.download.minecraft.net", &self.assets)
     }
 
-    pub fn rewrite_version_manifest(&self, manifest: &mut serde_json::Value) -> Result<()> {
+    /// 解析完 version_manifest 后立刻重写每个版本的 url，避免后续请求踩回 Mojang 源
+    pub fn rewrite_version_manifest(&self, manifest: &mut Value) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
         if let Some(versions) = manifest.get_mut("versions").and_then(|v| v.as_array_mut()) {
             for v in versions {
-                // 关键改动：用闭包替代 str::to_string，让编译器知道收到的是 &str
-                if let Some(url) = v.get("url").and_then(|u| u.as_str()).map(|s| s.to_string()) {
-                    let rewritten = self.rewrite(&url);
-                    v["url"] = serde_json::Value::String(rewritten);
+                if let Some(url) = v.get("url").and_then(|u| u.as_str()).map(str::to_string) {
+                    v["url"] = Value::String(self.rewrite(&url));
                 }
             }
         }

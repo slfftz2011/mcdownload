@@ -1,9 +1,11 @@
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use sha2::Digest as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Semaphore;
 
 #[derive(Clone, Copy, Debug)]
 pub enum HashAlgo {
@@ -11,10 +13,10 @@ pub enum HashAlgo {
     Sha256,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct ExpectedHash<'a> {
+#[derive(Clone, Debug)]
+pub struct ExpectedHash {
     pub algo: HashAlgo,
-    pub hex: &'a str,
+    pub hex: String,
 }
 
 enum Hasher {
@@ -53,148 +55,213 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-pub async fn download(
-    url: &str,
-    dest: &Path,
-    expected: Option<ExpectedHash<'_>>,
-) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .user_agent("mc-downloader/0.1")
-        .build()
-        .context("创建 HTTP 客户端失败")?;
+#[derive(Clone)]
+pub struct Downloader {
+    client: reqwest::Client,
+    sem: Arc<Semaphore>,
+    progress: Option<Arc<ProgressBar>>,
+    quiet: bool,
+}
 
-    let part = part_path(dest);
-    let mut announced = false;
-
-    loop {
-        let existing = file_len(&part).await;
-
-        // 续传时先把已有 .part 喂给 hasher 得到前缀状态
-        let mut hasher: Option<Hasher> = match expected {
-            Some(e) if existing > 0 => Some(hash_prefix(&part, e.algo).await?),
-            Some(e) => Some(Hasher::new(e.algo)),
-            None => None,
-        };
-
-        let mut req = client.get(url);
-        if existing > 0 {
-            if !announced {
-                println!("检测到未完成下载 ({} 字节)，尝试续传...", existing);
-                announced = true;
-            }
-            req = req.header(reqwest::header::RANGE, format!("bytes={}-", existing));
+impl Downloader {
+    pub fn new(concurrency: usize, quiet: bool) -> Self {
+        let client = reqwest::Client::builder()
+            .user_agent("mc-downloader/0.1")
+            .build()
+            .expect("构建 HTTP 客户端失败");
+        Self {
+            client,
+            sem: Arc::new(Semaphore::new(concurrency)),
+            progress: None,
+            quiet,
         }
+    }
 
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("请求失败: {url}"))?;
-        let status = resp.status();
+    pub fn with_progress(mut self, pb: Arc<ProgressBar>) -> Self {
+        self.progress = Some(pb);
+        self
+    }
 
-        // 416: .part 已经够长（可能刚好完整）
-        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-            let total = parse_content_range_total(resp.headers());
-            if existing > 0 && total == Some(existing) {
-                if let (Some(exp), Some(h)) = (expected, hasher) {
-                    let actual = h.finalize_hex();
-                    if !actual.eq_ignore_ascii_case(exp.hex) {
-                        tokio::fs::remove_file(&part).await.ok();
-                        bail!("哈希校验失败: 期望 {}, 实际 {}", exp.hex, actual);
-                    }
+    pub async fn download(
+        &self,
+        url: &str,
+        dest: &Path,
+        expected: Option<ExpectedHash>,
+    ) -> Result<()> {
+        let _permit = self.sem.acquire().await.context("获取并发许可失败")?;
+
+        if dest.exists() {
+            if let Some(ref exp) = expected {
+                if verify_file_hash(dest, exp.algo, &exp.hex).await.unwrap_or(false) {
+                    self.inc_progress();
+                    return Ok(());
                 }
-                tokio::fs::rename(&part, dest)
-                    .await
-                    .with_context(|| format!("重命名失败: {}", part.display()))?;
-                println!("本地片段已完整，直接使用: {}", dest.display());
+                tokio::fs::remove_file(dest).await.ok();
+            } else {
+                self.inc_progress();
                 return Ok(());
             }
-            // .part 比远端还大 / 远端变小 → 删掉重来
-            tokio::fs::remove_file(&part).await.ok();
-            announced = false;
-            continue;
         }
 
-        let resp = resp
-            .error_for_status()
-            .with_context(|| format!("服务器返回错误状态: {url}"))?;
-
-        let resume = status == reqwest::StatusCode::PARTIAL_CONTENT;
-
-        let (total, start) = if resume {
-            (resp.content_length().map(|len| existing + len), existing)
-        } else {
-            (resp.content_length(), 0)
-        };
-
-        // 服务器忽略 Range → 从头重写，前缀哈希作废，重置 hasher
-        if !resume {
-            if let Some(e) = expected {
-                hasher = Some(Hasher::new(e.algo));
-            }
-        }
-
-        let mut file = if resume && start > 0 {
-            tokio::fs::OpenOptions::new()
-                .append(true)
-                .open(&part)
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent)
                 .await
-                .with_context(|| format!("打开片段失败: {}", part.display()))?
-        } else {
-            tokio::fs::File::create(&part)
-                .await
-                .with_context(|| format!("创建片段失败: {}", part.display()))?
-        };
-
-        let pb = new_progress_bar(total, url, start);
-        let mut stream = resp.bytes_stream();
-        let mut written = start;
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.with_context(|| format!("下载中断: {url}"))?;
-            file.write_all(&chunk)
-                .await
-                .with_context(|| format!("写入失败: {}", part.display()))?;
-            if let Some(h) = hasher.as_mut() {
-                h.update(&chunk);
-            }
-            written += chunk.len() as u64;
-            pb.set_position(written);
+                .with_context(|| format!("创建目录失败: {}", parent.display()))?;
         }
 
-        file.flush().await?;
-        drop(file);
-
-        if let Some(expected_total) = total {
-            if written != expected_total {
-                bail!(
-                    "文件大小不匹配: 期望 {expected_total} 字节，实际 {written} 字节 (片段保留在 {})",
-                    part.display()
-                );
-            }
+        let result = self.do_download(url, dest, expected.as_ref()).await;
+        if result.is_ok() {
+            self.inc_progress();
         }
+        result
+    }
 
-        if let (Some(exp), Some(h)) = (expected, hasher.take()) {
-            let actual = h.finalize_hex();
-            if !actual.eq_ignore_ascii_case(exp.hex) {
+    async fn do_download(
+        &self,
+        url: &str,
+        dest: &Path,
+        expected: Option<&ExpectedHash>,
+    ) -> Result<()> {
+        let part = part_path(dest);
+        let mut announced = false;
+
+        loop {
+            let existing = file_len(&part).await;
+            let mut hasher = match expected {
+                Some(e) if existing > 0 => Some(hash_prefix(&part, e.algo).await?),
+                Some(e) => Some(Hasher::new(e.algo)),
+                None => None,
+            };
+
+            let mut req = self.client.get(url);
+            if existing > 0 {
+                if !announced && !self.quiet {
+                    eprintln!("续传 {} ({} 字节)", dest.display(), existing);
+                    announced = true;
+                }
+                req = req.header(reqwest::header::RANGE, format!("bytes={}-", existing));
+            }
+
+            let resp = req.send().await.with_context(|| format!("请求失败: {url}"))?;
+            let status = resp.status();
+
+            if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                let total = parse_content_range_total(resp.headers());
+                if existing > 0 && total == Some(existing) {
+                    if let (Some(exp), Some(h)) = (expected, hasher) {
+                        let actual = h.finalize_hex();
+                        if !actual.eq_ignore_ascii_case(&exp.hex) {
+                            tokio::fs::remove_file(&part).await.ok();
+                            bail!("哈希校验失败: 期望 {}, 实际 {}", exp.hex, actual);
+                        }
+                    }
+                    tokio::fs::rename(&part, dest).await?;
+                    return Ok(());
+                }
                 tokio::fs::remove_file(&part).await.ok();
-                bail!("哈希校验失败: 期望 {}, 实际 {}", exp.hex, actual);
+                announced = false;
+                continue;
             }
-        }
 
-        tokio::fs::rename(&part, dest)
-            .await
-            .with_context(|| format!("重命名失败: {}", part.display()))?;
-        pb.finish_with_message(format!("✓ {url}"));
-        return Ok(());
+            let resp = resp.error_for_status().with_context(|| format!("服务器错误: {url}"))?;
+            let resume = status == reqwest::StatusCode::PARTIAL_CONTENT;
+            let (total, start) = if resume {
+                (resp.content_length().map(|l| existing + l), existing)
+            } else {
+                (resp.content_length(), 0)
+            };
+
+            if !resume {
+                if let Some(e) = expected {
+                    hasher = Some(Hasher::new(e.algo));
+                }
+            }
+
+            let mut file = if resume && start > 0 {
+                tokio::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&part)
+                    .await
+                    .with_context(|| format!("打开片段失败: {}", part.display()))?
+            } else {
+                tokio::fs::File::create(&part)
+                    .await
+                    .with_context(|| format!("创建片段失败: {}", part.display()))?
+            };
+
+            let pb = if self.progress.is_none() {
+                Some(new_progress_bar(total, url, start))
+            } else {
+                None
+            };
+
+            let mut stream = resp.bytes_stream();
+            let mut written = start;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.with_context(|| format!("下载中断: {url}"))?;
+                file.write_all(&chunk).await?;
+                if let Some(h) = hasher.as_mut() {
+                    h.update(&chunk);
+                }
+                written += chunk.len() as u64;
+                if let Some(pb) = &pb {
+                    pb.set_position(written);
+                }
+            }
+            file.flush().await?;
+            drop(file);
+
+            if let Some(expected_total) = total {
+                if written != expected_total {
+                    bail!(
+                        "大小不匹配: 期望 {} 实际 {} (片段保留在 {})",
+                        expected_total,
+                        written,
+                        part.display()
+                    );
+                }
+            }
+
+            if let (Some(exp), Some(h)) = (expected, hasher.take()) {
+                let actual = h.finalize_hex();
+                if !actual.eq_ignore_ascii_case(&exp.hex) {
+                    tokio::fs::remove_file(&part).await.ok();
+                    bail!("哈希校验失败: 期望 {}, 实际 {}", exp.hex, actual);
+                }
+            }
+
+            tokio::fs::rename(&part, dest).await?;
+            if let Some(pb) = pb {
+                pb.finish_and_clear();
+            }
+            return Ok(());
+        }
+    }
+
+    fn inc_progress(&self) {
+        if let Some(pb) = &self.progress {
+            pb.inc(1);
+        }
     }
 }
 
-/// 读取已有 `.part` 全量喂给 hasher，得到前缀状态
+pub async fn verify_file_hash(path: &Path, algo: HashAlgo, expected_hex: &str) -> Result<bool> {
+    let mut hasher = Hasher::new(algo);
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize_hex().eq_ignore_ascii_case(expected_hex))
+}
+
 async fn hash_prefix(path: &Path, algo: HashAlgo) -> Result<Hasher> {
     let mut hasher = Hasher::new(algo);
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .with_context(|| format!("打开片段失败: {}", path.display()))?;
+    let mut file = tokio::fs::File::open(path).await?;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = file.read(&mut buf).await?;
@@ -217,14 +284,12 @@ async fn file_len(path: &Path) -> u64 {
 }
 
 fn parse_content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    let value = headers
-        .get(reqwest::header::CONTENT_RANGE)?
-        .to_str()
-        .ok()?;
+    let value = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
     value.rsplit('/').next()?.trim().parse().ok()
 }
 
 fn new_progress_bar(total: Option<u64>, url: &str, start: u64) -> ProgressBar {
+    use indicatif::ProgressStyle;
     match total {
         Some(len) => {
             let pb = ProgressBar::new(len);
