@@ -14,11 +14,13 @@ pub async fn install(
     base_dir: &Path,
     mirror: &MirrorConfig,
     concurrency: usize,
+    chunk_size: u64,
+    seg_threshold: u64,
 ) -> Result<()> {
     println!("目标目录: {}", base_dir.display());
     println!("版本: {}", version_id);
 
-    // 1. 下载并解析 manifest
+    // 1. manifest
     println!("获取版本清单...");
     let manifest_url = mirror.version_manifest.clone();
     let manifest_bytes = http_get(&manifest_url).await?;
@@ -30,9 +32,8 @@ pub async fn install(
     let entry = manifest.resolve(version_id)?.clone();
     println!("解析到版本: {} ({})", entry.id, entry.kind);
 
-    // 2. 下载 version.json
-    let version_json_url = entry.url.clone();
-    let version_bytes = http_get(&version_json_url).await?;
+    // 2. version.json
+    let version_bytes = http_get(&entry.url).await?;
     let version = VersionJson::from_slice(&version_bytes)?;
 
     let version_dir = base_dir.join("versions").join(&version.id);
@@ -43,10 +44,9 @@ pub async fn install(
     )
     .await?;
 
-    // 3. 收集所有下载任务
+    // 3. 收集任务
     let mut tasks: Vec<Task> = Vec::new();
 
-    // 3a. client.jar
     if let Some(dl) = &version.downloads {
         if let Some(client) = &dl.client {
             tasks.push(Task {
@@ -58,7 +58,6 @@ pub async fn install(
         }
     }
 
-    // 3b. libraries
     let libs = collect_libraries(&version.libraries, &mirror.maven);
     println!("libraries 待下载: {} 项", libs.len());
     for lib in libs {
@@ -70,10 +69,12 @@ pub async fn install(
         });
     }
 
-    // 3c. asset index + objects
     if let Some(idx_ref) = &version.asset_index {
         let idx_url = mirror.rewrite(&idx_ref.url);
-        let idx_dest = base_dir.join("assets").join("indexes").join(format!("{}.json", idx_ref.id));
+        let idx_dest = base_dir
+            .join("assets")
+            .join("indexes")
+            .join(format!("{}.json", idx_ref.id));
         tokio::fs::create_dir_all(idx_dest.parent().unwrap()).await?;
         let idx_bytes = http_get(&idx_url).await?;
         tokio::fs::write(&idx_dest, &idx_bytes).await?;
@@ -83,7 +84,11 @@ pub async fn install(
         println!("assets 待下载: {} 个对象", unique.len());
         for obj in unique {
             let h2 = &obj.hash[..2];
-            let dest = base_dir.join("assets").join("objects").join(h2).join(&obj.hash);
+            let dest = base_dir
+                .join("assets")
+                .join("objects")
+                .join(h2)
+                .join(&obj.hash);
             let url = format!("https://resources.download.minecraft.net/{h2}/{}", obj.hash);
             tasks.push(Task {
                 url: mirror.rewrite(&url),
@@ -96,19 +101,29 @@ pub async fn install(
 
     // 4. 并发下载
     let total = tasks.len();
-    println!("开始下载，共 {} 个文件，并发 {}", total, concurrency);
+    println!(
+        "开始下载，共 {} 个文件，全局并发 {}，分块阈值 {} MB，块大小 {} MB",
+        total,
+        concurrency,
+        seg_threshold / (1024 * 1024),
+        chunk_size / (1024 * 1024)
+    );
 
     let pb = Arc::new(ProgressBar::new(total as u64));
     pb.set_style(
-        ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) {msg}")
-            .unwrap()
-            .progress_chars("=> "),
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) {msg}",
+        )
+        .unwrap()
+        .progress_chars("=> "),
     );
     pb.set_message("准备中");
 
-    let dl = Downloader::new(concurrency, true).with_progress(pb.clone());
-    let errors: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let dl = Downloader::new(concurrency, true)
+        .with_progress(pb.clone())
+        .with_chunking(chunk_size, seg_threshold);
 
+    let errors: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let mut handles = Vec::with_capacity(total);
     for task in tasks {
         let dl = dl.clone();

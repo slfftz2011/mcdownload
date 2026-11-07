@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn cmd_url(pos: Vec<String>, flags: &Flags) -> Result<()> {
+async fn cmd_url(pos: Vec<String>, _mirror: &MirrorConfig, flags: &Flags) -> Result<()> {
     if pos.is_empty() {
         bail!("用法: mc-downloader url [--sha1 X|--sha256 X] <URL> [输出]");
     }
@@ -53,30 +53,30 @@ async fn cmd_url(pos: Vec<String>, flags: &Flags) -> Result<()> {
             tokio::fs::create_dir_all(parent).await?;
         }
     }
+
     let expected = if let Some(h) = flags.sha1.as_ref() {
-        Some(ExpectedHash { algo: HashAlgo::Sha1, hex: h.clone() })
+        Some(ExpectedHash {
+            algo: HashAlgo::Sha1,
+            hex: h.clone(),
+        })
     } else {
         flags.sha256.as_ref().map(|h| ExpectedHash {
             algo: HashAlgo::Sha256,
             hex: h.clone(),
         })
     };
-    let dl = Downloader::new(1, false);
+
+    let chunk_size = flags.chunk_size.unwrap_or(4 * 1024 * 1024);
+    let seg_threshold = flags.seg_threshold.unwrap_or(8 * 1024 * 1024);
+
+    let dl = Downloader::new(flags.concurrency, false)
+        .with_chunking(chunk_size, seg_threshold);
+
     dl.download(url, &dest, expected).await?;
+
     let size = tokio::fs::metadata(&dest).await?.len();
     println!("完成: {} ({})", dest.display(), human_size(size));
     Ok(())
-}
-
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut size = bytes as f64;
-    let mut idx = 0;
-    while size >= 1024.0 && idx < UNITS.len() - 1 {
-        size /= 1024.0;
-        idx += 1;
-    }
-    format!("{:.2} {}", size, UNITS[idx])
 }
 
 async fn cmd_manifest(mirror: &MirrorConfig, flags: &Flags) -> Result<()> {
@@ -99,7 +99,7 @@ async fn cmd_manifest(mirror: &MirrorConfig, flags: &Flags) -> Result<()> {
         println!("  {:<16} {:<12} {}", v.id, v.kind, v.release_time);
     }
     if limit < manifest.versions.len() {
-        println!("  ...（省略 {} 条，--limit 0 显示全部）", manifest.versions.len() - limit);
+        println!("  ...（省略 {} 条）", manifest.versions.len() - limit);
     }
     Ok(())
 }
@@ -111,10 +111,18 @@ async fn cmd_install(pos: Vec<String>, mirror: &MirrorConfig, flags: &Flags) -> 
         .as_ref()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("minecraft"));
-    install::install(version, &base, mirror, flags.concurrency).await
+    let chunk_size = flags.chunk_size.unwrap_or(4 * 1024 * 1024);
+    let seg_threshold = flags.seg_threshold.unwrap_or(8 * 1024 * 1024);
+    install::install(
+        version,
+        &base,
+        mirror,
+        flags.concurrency,
+        chunk_size,
+        seg_threshold,
+    )
+    .await
 }
-
-// ---------- 参数解析 ----------
 
 struct Flags {
     official: bool,
@@ -123,6 +131,8 @@ struct Flags {
     dir: Option<String>,
     sha1: Option<String>,
     sha256: Option<String>,
+    chunk_size: Option<u64>,
+    seg_threshold: Option<u64>,
 }
 
 fn parse_flags(args: &[String]) -> Result<(Vec<String>, Flags)> {
@@ -134,6 +144,8 @@ fn parse_flags(args: &[String]) -> Result<(Vec<String>, Flags)> {
         dir: None,
         sha1: None,
         sha256: None,
+        chunk_size: None,
+        seg_threshold: None,
     };
     let mut i = 0;
     while i < args.len() {
@@ -159,6 +171,16 @@ fn parse_flags(args: &[String]) -> Result<(Vec<String>, Flags)> {
             "--sha256" => {
                 i += 1;
                 flags.sha256 = Some(args.get(i).context("--sha256 需要一个值")?.to_lowercase());
+            }
+            "--chunk-size" => {
+                i += 1;
+                let mb: u64 = args.get(i).context("--chunk-size 需要 MB 数")?.parse()?;
+                flags.chunk_size = Some(mb * 1024 * 1024);
+            }
+            "--seg-threshold" => {
+                i += 1;
+                let mb: u64 = args.get(i).context("--seg-threshold 需要 MB 数")?.parse()?;
+                flags.seg_threshold = Some(mb * 1024 * 1024);
             }
             "-h" | "--help" => {
                 print_usage();
@@ -198,13 +220,26 @@ fn resolve_dest(url: &str, arg: Option<&String>) -> Result<PathBuf> {
 
 fn print_usage() {
     eprintln!("用法:");
-    eprintln!("  mc-downloader url [--sha1 X|--sha256 X] <URL> [输出路径]");
+    eprintln!("  mc-downloader url [--sha1 X|--sha256 X] [--chunk-size MB] [--seg-threshold MB] <URL> [输出]");
     eprintln!("  mc-downloader manifest [--limit N] [--official]");
-    eprintln!("  mc-downloader install [版本ID|latest] [-d 目录] [-c 并发数] [--official]");
+    eprintln!("  mc-downloader install [版本ID|latest] [-d 目录] [-c 并发数] [--chunk-size MB] [--seg-threshold MB] [--official]");
     eprintln!();
     eprintln!("参数:");
-    eprintln!("  --official      使用官方源（默认走 BMCLAPI 镜像）");
-    eprintln!("  -c <N>          并发数，默认 16");
-    eprintln!("  -d <DIR>        安装目录，默认 ./minecraft");
-    eprintln!("  --limit <N>     manifest 列表显示条数，默认全部");
+    eprintln!("  --official          使用官方源（默认走 BMCLAPI 镜像）");
+    eprintln!("  -c <N>              全局并发上限，默认 16");
+    eprintln!("  -d <DIR>            安装目录，默认 ./minecraft");
+    eprintln!("  --limit <N>         manifest 列表显示条数");
+    eprintln!("  --chunk-size <MB>   分块大小，默认 4 MB");
+    eprintln!("  --seg-threshold <MB> 分块阈值，低于此值不分块，默认 8 MB");
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut idx = 0;
+    while size >= 1024.0 && idx < UNITS.len() - 1 {
+        size /= 1024.0;
+        idx += 1;
+    }
+    format!("{:.2} {}", size, UNITS[idx])
 }
