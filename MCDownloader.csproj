@@ -8,6 +8,10 @@
     <AssemblyName>MCDownloader</AssemblyName>
     <ApplicationIcon />
     <LangVersion>latest</LangVersion>
+
+    <OutputPath>bin\Release\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
   </PropertyGroup>
 
   <ItemGroup>
