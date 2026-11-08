@@ -15,6 +15,15 @@ public class DownloadEngine
 {
     private static readonly HttpClient Client = CreateClient();
 
+    /// <summary>分块大小，默认 4 MB</summary>
+    public long ChunkSize { get; set; } = 4 * 1024 * 1024;
+
+    /// <summary>低于此大小不分块，默认 8 MB</summary>
+    public long SegThreshold { get; set; } = 8 * 1024 * 1024;
+
+    /// <summary>全局并发上限，默认 8（跨块、跨文件统一）</summary>
+    public int MaxConcurrency { get; set; } = 8;
+
     private static HttpClient CreateClient()
     {
         var handler = new HttpClientHandler
@@ -25,13 +34,10 @@ public class DownloadEngine
         {
             Timeout = Timeout.InfiniteTimeSpan,
         };
-        client.DefaultRequestHeaders.UserAgent.ParseAdd("MCDownloader/0.1");
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("MCDownloader/0.2");
         return client;
     }
 
-    /// <summary>
-    /// 下载文件。expected 为 null 时跳过哈希校验。
-    /// </summary>
     public async Task DownloadFileAsync(
         string url,
         string destPath,
@@ -43,6 +49,365 @@ public class DownloadEngine
         if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
             Directory.CreateDirectory(dir);
 
+        var probe = await ProbeAsync(url, ct).ConfigureAwait(false);
+
+        if (probe.SupportsRange
+            && probe.Total.HasValue
+            && probe.Total.Value >= SegThreshold
+            && ChunkSize > 0)
+        {
+            await DoDownloadSegmentedAsync(url, destPath, expected, probe.Total.Value, progress, ct)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            await DoDownloadSingleAsync(url, destPath, expected, progress, ct)
+                .ConfigureAwait(false);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 探测
+    // ─────────────────────────────────────────────────────
+
+    private class ProbeResult
+    {
+        public bool SupportsRange;
+        public long? Total;
+    }
+
+    private async Task<ProbeResult> ProbeAsync(string url, CancellationToken ct)
+    {
+        var result = new ProbeResult { SupportsRange = false, Total = null };
+        try
+        {
+            var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Range = new RangeHeaderValue(0, 0);
+
+            using (var response = await Client
+                .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct)
+                .ConfigureAwait(false))
+            {
+                if (response.StatusCode == HttpStatusCode.PartialContent)
+                {
+                    result.SupportsRange = true;
+                    result.Total = response.Content.Headers.ContentRange?.Length;
+                }
+                else if (response.IsSuccessStatusCode)
+                {
+                    result.SupportsRange = false;
+                    result.Total = response.Content.Headers.ContentLength;
+                }
+            }
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { /* 探测失败一律走单线程 */ }
+
+        return result;
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 分块下载
+    // ─────────────────────────────────────────────────────
+
+    private async Task DoDownloadSegmentedAsync(
+        string url,
+        string destPath,
+        ExpectedHash expected,
+        long total,
+        IProgress<DownloadProgress> progress,
+        CancellationToken ct)
+    {
+        var fileName = Path.GetFileName(destPath);
+        var finalPart = destPath + ".part";
+        long chunkSize = ChunkSize;
+        long numChunks = (total + chunkSize - 1) / chunkSize;
+
+        // 全局已写入字节数（含各块续传前缀），用于进度报告
+        long totalWritten = 0;
+
+        // 1. 统计已有块前缀
+        for (long i = 0; i < numChunks; i++)
+        {
+            var cp = ChunkPath(destPath, i);
+            if (File.Exists(cp))
+            {
+                var len = new FileInfo(cp).Length;
+                var expectedLen = ChunkLenAt(i, total, chunkSize);
+                totalWritten += Math.Min(len, expectedLen);
+            }
+        }
+        Interlocked.Exchange(ref totalWritten, totalWritten);
+        var globalWritten = new StrongBox<long>(totalWritten);
+
+        progress?.Report(new DownloadProgress
+        {
+            FileName = fileName,
+            CurrentBytes = globalWritten.Value,
+            TotalBytes = total,
+            Percent = (double)globalWritten.Value / total * 100.0,
+            Speed = "",
+            Status = totalWritten > 0 ? $"分块续传 ({numChunks} 块)" : $"分块下载 ({numChunks} 块)",
+        });
+
+        // 2. 节流报告任务
+        using (var reportCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+        {
+            var sw = Stopwatch.StartNew();
+            long lastBytes = globalWritten.Value;
+            var lastReport = TimeSpan.Zero;
+
+            var reporter = Task.Run(async () =>
+            {
+                while (!reportCts.IsCancellationRequested)
+                {
+                    try
+                    {
+                        await Task.Delay(120, reportCts.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) { return; }
+
+                    var now = sw.Elapsed;
+                    var current = Interlocked.Read(ref globalWritten.Value);
+                    var dt = (now - lastReport).TotalSeconds;
+                    var speed = dt > 0 ? (current - lastBytes) / dt : 0;
+
+                    progress?.Report(new DownloadProgress
+                    {
+                        FileName = fileName,
+                        CurrentBytes = current,
+                        TotalBytes = total,
+                        Percent = total > 0 ? (double)current / total * 100.0 : 0,
+                        Speed = HumanSpeed(speed),
+                        Status = $"分块下载 ({numChunks} 块)",
+                    });
+
+                    lastReport = now;
+                    lastBytes = current;
+                }
+            }, reportCts.Token);
+
+            // 3. 并发下载所有块
+            var sem = new SemaphoreSlim(MaxConcurrency, MaxConcurrency);
+            var chunkTasks = new Task[numChunks];
+            try
+            {
+                for (long i = 0; i < numChunks; i++)
+                {
+                    long idx = i;
+                    chunkTasks[i] = Task.Run(async () =>
+                    {
+                        await sem.WaitAsync(ct).ConfigureAwait(false);
+                        try
+                        {
+                            await DownloadChunkAsync(
+                                url, destPath, idx, chunkSize, total, globalWritten, ct)
+                                .ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            sem.Release();
+                        }
+                    }, ct);
+                }
+
+                await Task.WhenAll(chunkTasks).ConfigureAwait(false);
+            }
+            finally
+            {
+                reportCts.Cancel();
+                try { await reporter.ConfigureAwait(false); } catch { }
+                sem.Dispose();
+            }
+        }
+
+        // 4. 校验每块大小
+        for (long i = 0; i < numChunks; i++)
+        {
+            var cp = ChunkPath(destPath, i);
+            var expectedLen = ChunkLenAt(i, total, chunkSize);
+            var actual = new FileInfo(cp).Length;
+            if (actual != expectedLen)
+                throw new IOException($"块 {i} 大小不匹配: 期望 {expectedLen}，实际 {actual}");
+        }
+
+        // 5. 合并 + 哈希
+        progress?.Report(new DownloadProgress
+        {
+            FileName = fileName,
+            CurrentBytes = total,
+            TotalBytes = total,
+            Percent = 100,
+            Speed = "",
+            Status = "合并中...",
+        });
+
+        await MergeChunksAsync(destPath, finalPart, numChunks, expected, ct).ConfigureAwait(false);
+
+        progress?.Report(new DownloadProgress
+        {
+            FileName = fileName,
+            CurrentBytes = total,
+            TotalBytes = total,
+            Percent = 100,
+            Speed = "0 B/s",
+            Status = expected != null ? "完成（校验通过）" : "完成",
+        });
+    }
+
+    private async Task DownloadChunkAsync(
+        string url,
+        string destPath,
+        long index,
+        long chunkSize,
+        long total,
+        StrongBox<long> globalWritten,
+        CancellationToken ct)
+    {
+        long start = index * chunkSize;
+        long endExclusive = Math.Min(start + chunkSize, total);
+        long chunkLen = endExclusive - start;
+        var chunkPath = ChunkPath(destPath, index);
+
+        long existing = File.Exists(chunkPath) ? new FileInfo(chunkPath).Length : 0;
+        if (existing > chunkLen) existing = chunkLen;
+        if (existing == chunkLen) return;   // 已完成
+
+        long rangeStart = start + existing;
+        long rangeEnd = endExclusive - 1;
+
+        var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.Range = new RangeHeaderValue(rangeStart, rangeEnd);
+
+        using (var response = await Client
+            .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct)
+            .ConfigureAwait(false))
+        {
+            if (response.StatusCode != HttpStatusCode.PartialContent)
+                throw new IOException(
+                    $"块 {index} 未返回 206（实际 {(int)response.StatusCode}），服务器可能中途不支持 Range");
+
+            using (var src = await response.Content.ReadAsStreamAsync().ConfigureAwait(false))
+            using (var fs = new FileStream(
+                chunkPath,
+                existing > 0 ? FileMode.Append : FileMode.Create,
+                FileAccess.Write,
+                FileShare.None,
+                bufferSize: 81920,
+                useAsync: true))
+            {
+                var buffer = new byte[81920];
+                long written = existing;
+
+                while (true)
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    int read = await src
+                        .ReadAsync(buffer, 0, buffer.Length, ct)
+                        .ConfigureAwait(false);
+                    if (read == 0) break;
+
+                    await fs
+                        .WriteAsync(buffer, 0, read, ct)
+                        .ConfigureAwait(false);
+
+                    written += read;
+                    Interlocked.Add(ref globalWritten.Value, read);
+                }
+
+                fs.Flush();
+
+                if (written != chunkLen)
+                    throw new IOException(
+                        $"块 {index} 大小不匹配: 期望 {chunkLen}，实际 {written}");
+            }
+        }
+    }
+
+    private async Task MergeChunksAsync(
+        string destPath,
+        string finalPart,
+        long numChunks,
+        ExpectedHash expected,
+        CancellationToken ct)
+    {
+        HashAlgorithm hasher = expected != null ? CreateHasher(expected.Algo) : null;
+        try
+        {
+            using (var outFs = new FileStream(
+                finalPart, FileMode.Create, FileAccess.Write, FileShare.None, 81920, useAsync: true))
+            {
+                var buffer = new byte[81920];
+
+                for (long i = 0; i < numChunks; i++)
+                {
+                    var cp = ChunkPath(destPath, i);
+                    using (var inFs = new FileStream(
+                        cp, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true))
+                    {
+                        while (true)
+                        {
+                            ct.ThrowIfCancellationRequested();
+
+                            int read = await inFs
+                                .ReadAsync(buffer, 0, buffer.Length, ct)
+                                .ConfigureAwait(false);
+                            if (read == 0) break;
+
+                            await outFs
+                                .WriteAsync(buffer, 0, read, ct)
+                                .ConfigureAwait(false);
+
+                            hasher?.TransformBlock(buffer, 0, read, buffer, 0);
+                        }
+                    }
+                }
+
+                outFs.Flush();
+            }
+
+            // 哈希校验
+            if (hasher != null)
+            {
+                var actualHex = FinishHasher(hasher);
+                if (!actualHex.Equals(expected.Hex, StringComparison.OrdinalIgnoreCase))
+                {
+                    File.Delete(finalPart);
+                    for (long i = 0; i < numChunks; i++)
+                        File.Delete(ChunkPath(destPath, i));
+                    throw new IOException(
+                        $"哈希校验失败: 期望 {expected.Hex}，实际 {actualHex}");
+                }
+            }
+
+            // rename
+            if (File.Exists(destPath)) File.Delete(destPath);
+            File.Move(finalPart, destPath);
+
+            // 清理块
+            for (long i = 0; i < numChunks; i++)
+            {
+                try { File.Delete(ChunkPath(destPath, i)); } catch { }
+            }
+        }
+        finally
+        {
+            hasher?.Dispose();
+        }
+    }
+
+    // ─────────────────────────────────────────────────────
+    // 单线程下载（保留原断点续传 + 前缀哈希逻辑）
+    // ─────────────────────────────────────────────────────
+
+    private async Task DoDownloadSingleAsync(
+        string url,
+        string destPath,
+        ExpectedHash expected,
+        IProgress<DownloadProgress> progress,
+        CancellationToken ct)
+    {
         var fileName = Path.GetFileName(destPath);
         var partPath = destPath + ".part";
 
@@ -71,14 +436,12 @@ public class DownloadEngine
                 .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct)
                 .ConfigureAwait(false))
             {
-                // ── 416 分支：.part 已经够了 ─────────────────
+                // 416
                 if (response.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
                 {
                     var totalFromHeader = response.Content.Headers.ContentRange?.Length;
-
                     if (existing > 0 && totalFromHeader == existing)
                     {
-                        // .part 已完整，校验哈希后改名
                         if (expected != null)
                         {
                             progress?.Report(new DownloadProgress
@@ -111,7 +474,6 @@ public class DownloadEngine
                         });
                         return;
                     }
-
                     File.Delete(partPath);
                     continue;
                 }
@@ -119,24 +481,19 @@ public class DownloadEngine
                 response.EnsureSuccessStatusCode();
 
                 bool resumed = response.StatusCode == HttpStatusCode.PartialContent;
-                if (!resumed && existing > 0)
-                    existing = 0;   // 服务器忽略 Range，从头下
+                if (!resumed && existing > 0) existing = 0;
 
                 long total = -1;
                 if (resumed)
                 {
                     var remaining = response.Content.Headers.ContentLength;
-                    if (remaining.HasValue)
-                        total = existing + remaining.Value;
+                    if (remaining.HasValue) total = existing + remaining.Value;
                 }
                 else
                 {
                     total = response.Content.Headers.ContentLength ?? -1L;
                 }
 
-                // ── 构建 hasher ──────────────────────────────
-                // 续传：先把已有 .part 内容喂给 hasher
-                // 从头：空 hasher
                 HashAlgorithm hasher = null;
                 if (expected != null)
                 {
@@ -148,9 +505,7 @@ public class DownloadEngine
 
                 try
                 {
-                    using (var src = await response.Content
-                        .ReadAsStreamAsync()
-                        .ConfigureAwait(false))
+                    using (var src = await response.Content.ReadAsStreamAsync().ConfigureAwait(false))
                     using (var fs = new FileStream(
                         partPath,
                         resumed ? FileMode.Append : FileMode.Create,
@@ -179,9 +534,7 @@ public class DownloadEngine
                                 .WriteAsync(buffer, 0, read, ct)
                                 .ConfigureAwait(false);
 
-                            // 边写边算哈希
                             hasher?.TransformBlock(buffer, 0, read, buffer, 0);
-
                             received += read;
 
                             var now = sw.Elapsed;
@@ -209,13 +562,11 @@ public class DownloadEngine
                         fs.Flush();
                     }
 
-                    // ── 大小校验 ────────────────────────────
                     var actual = new FileInfo(partPath).Length;
                     if (total > 0 && actual != total)
                         throw new IOException(
                             $"大小不匹配: 期望 {total} 字节，实际 {actual} 字节");
 
-                    // ── 哈希校验 ────────────────────────────
                     if (hasher != null)
                     {
                         progress?.Report(new DownloadProgress
@@ -237,7 +588,6 @@ public class DownloadEngine
                         }
                     }
 
-                    // ── .part → 目标文件 ────────────────────
                     if (File.Exists(destPath)) File.Delete(destPath);
                     File.Move(partPath, destPath);
 
@@ -254,7 +604,6 @@ public class DownloadEngine
                 }
                 finally
                 {
-                    // 无论成功失败，释放 hasher 资源
                     hasher?.Dispose();
                 }
             }
@@ -263,27 +612,29 @@ public class DownloadEngine
         throw new IOException("续传失败：.part 与远端不一致，已放弃");
     }
 
-    // ── 哈希工具 ───────────────────────────────────────
+    // ─────────────────────────────────────────────────────
+    // 工具
+    // ─────────────────────────────────────────────────────
 
-    private static HashAlgorithm CreateHasher(HashAlgo algo)
+    private static string ChunkPath(string destPath, long index)
+        => destPath + ".part." + index.ToString();
+
+    private static long ChunkLenAt(long index, long total, long chunkSize)
     {
-        return algo == HashAlgo.Sha1
-            ? (HashAlgorithm)SHA1.Create()
-            : SHA256.Create();
+        long start = index * chunkSize;
+        return Math.Min(start + chunkSize, total) - start;
     }
 
-    /// <summary>
-    /// 读已有 .part 全部内容喂给 hasher，得到「前缀状态」。
-    /// 用 Task.Run 包一层，避免续传大文件时阻塞 UI 线程。
-    /// </summary>
+    private static HashAlgorithm CreateHasher(HashAlgo algo)
+        => algo == HashAlgo.Sha1 ? (HashAlgorithm)SHA1.Create() : SHA256.Create();
+
     private static Task<HashAlgorithm> HashExistingPartAsync(
         string path, HashAlgo algo, CancellationToken ct)
     {
         return Task.Run(() =>
         {
             var hasher = CreateHasher(algo);
-            using (var fs = new FileStream(
-                path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920))
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920))
             {
                 var buffer = new byte[81920];
                 int read;
@@ -297,9 +648,6 @@ public class DownloadEngine
         }, ct);
     }
 
-    /// <summary>
-    /// 收尾：TransformFinalBlock + 十六进制小写。
-    /// </summary>
     private static string FinishHasher(HashAlgorithm hasher)
     {
         hasher.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
@@ -308,17 +656,13 @@ public class DownloadEngine
             .ToLowerInvariant();
     }
 
-    /// <summary>
-    /// 独立校验一个完整文件的哈希（用于 416 分支）。
-    /// </summary>
     private static Task<bool> VerifyFileHashAsync(
         string path, ExpectedHash expected, CancellationToken ct)
     {
         return Task.Run(() =>
         {
             using (var hasher = CreateHasher(expected.Algo))
-            using (var fs = new FileStream(
-                path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920))
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920))
             {
                 var buffer = new byte[81920];
                 int read;
@@ -335,8 +679,6 @@ public class DownloadEngine
             }
         }, ct);
     }
-
-    // ── 格式化工具 ─────────────────────────────────────
 
     private static string FormatSize(long bytes)
     {

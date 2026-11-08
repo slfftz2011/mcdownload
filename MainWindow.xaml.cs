@@ -151,7 +151,12 @@ public partial class MainWindow : Window
                 StatusText.Text = $"{p.CurrentBytes:N0} 字节";
         });
 
-        var engine = new DownloadEngine();
+        var engine = new DownloadEngine
+        {
+            ChunkSize = 4 * 1024 * 1024,
+            SegThreshold = 8 * 1024 * 1024,
+            MaxConcurrency = 8,
+        };
         try
         {
             await engine.DownloadFileAsync(url, destPath, expected, progress, _cts.Token);
