@@ -47,6 +47,9 @@ jobs:
           cargo update -p tokio-util --precise 0.7.17
           cargo update -p hyper-rustls --precise 0.27.7
           cargo update -p utf8_iter --precise 1.0.4
+          cargo update -p darling_core --precise 0.20.11
+          cargo update -p darling_macro --precise 0.20.11
+          cargo update -p darling --precise 0.20.11
 
       # 循环兜底：碰到漏网的 Edition 2024 依赖就按规则表降级
       - name: Auto-downgrade remaining incompatibilities
