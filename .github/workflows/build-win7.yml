@@ -47,6 +47,7 @@ jobs:
           cargo update -p idna_adapter --precise 1.1.0
           cargo update -p quinn --precise 0.11.8 || true
           cargo update -p quinn-proto --precise 0.11.14 || true
+          cargo update -p unicode-segmentation --precise 1.12.0
 
       # 循环兜底：碰到漏网的 Edition 2024 依赖就按规则表降级
       - name: Auto-downgrade remaining incompatibilities
