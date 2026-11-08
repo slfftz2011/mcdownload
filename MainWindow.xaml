@@ -118,6 +118,29 @@
                                Foreground="{StaticResource TextSecondary}" FontSize="12"/>
                 </StackPanel>
             </Border>
+
+            <Grid Margin="0,8,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <ComboBox x:Name="HashAlgoBox" Grid.Column="0" Width="110"
+                        SelectionChanged="HashAlgoBox_SelectionChanged">
+                    <ComboBoxItem Content="不校验" IsSelected="True"/>
+                    <ComboBoxItem Content="SHA-1"/>
+                    <ComboBoxItem Content="SHA-256"/>
+                </ComboBox>
+                <TextBox x:Name="HashHexBox" Grid.Column="1" Margin="8,0,0,0"
+                        Padding="10,6"
+                        Background="{StaticResource InputBg}"
+                        Foreground="{StaticResource TextPrimary}"
+                        BorderBrush="{StaticResource Divider}"
+                        BorderThickness="1"
+                        VerticalContentAlignment="Center"
+                        FontSize="12"
+                        IsEnabled="False"
+                        ToolTip="粘贴完整十六进制哈希"/>
+            </Grid>
         </Grid>
 
         <!-- 底部状态栏 -->

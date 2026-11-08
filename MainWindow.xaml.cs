@@ -67,7 +67,7 @@ public partial class MainWindow : Window
         // 骨架阶段仍用 manifest 测试，后续替换为完整 install 流程
         var testUrl = "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json";
         var dest = Path.Combine("downloads", item.Id, "version_manifest.json");
-        await RunDownloadAsync(testUrl, dest);
+        await RunDownloadAsync(testUrl, dest, null);
     }
 
     private async void CustomDownloadBtn_Click(object sender, RoutedEventArgs e)
@@ -84,7 +84,6 @@ public partial class MainWindow : Window
             StatusText.Text = "请输入下载地址";
             return;
         }
-
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)
             || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
         {
@@ -92,9 +91,20 @@ public partial class MainWindow : Window
             return;
         }
 
+        ExpectedHash expected;
+        try
+        {
+            expected = BuildExpectedHash();
+        }
+        catch (ArgumentException ex)
+        {
+            StatusText.Text = ex.Message;
+            return;
+        }
+
         var fileName = InferFileName(uri);
         var dest = Path.Combine("downloads", "custom", fileName);
-        await RunDownloadAsync(url, dest);
+        await RunDownloadAsync(url, dest, expected);
     }
 
     private async System.Threading.Tasks.Task RunDownloadAsync(string url, string destPath)
@@ -116,8 +126,10 @@ public partial class MainWindow : Window
         var engine = new DownloadEngine();
         try
         {
-            await engine.DownloadFileAsync(url, destPath, progress, _cts.Token);
-            StatusText.Text = $"✓ 下载完成: {destPath}";
+            await engine.DownloadFileAsync(url, destPath, expected, progress, _cts.Token);
+            StatusText.Text = expected != null
+                ? $"✓ 下载完成且校验通过: {destPath}"
+                : $"✓ 下载完成: {destPath}";
         }
         catch (OperationCanceledException)
         {
@@ -164,5 +176,28 @@ public partial class MainWindow : Window
         Show();
         Activate();
         _ball?.Hide();
+    }
+
+    private void HashAlgoBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (HashHexBox == null) return;
+        HashHexBox.IsEnabled = HashAlgoBox.SelectedIndex > 0;
+    }
+
+    private ExpectedHash BuildExpectedHash()
+    {
+        if (HashAlgoBox.SelectedIndex <= 0) return null;
+
+        var hex = (HashHexBox.Text ?? "").Trim().ToLowerInvariant();
+        if (string.IsNullOrEmpty(hex)) return null;
+
+        var algo = HashAlgoBox.SelectedIndex == 1 ? HashAlgo.Sha1 : HashAlgo.Sha256;
+        var expectedLen = algo == HashAlgo.Sha1 ? 40 : 64;
+
+        if (hex.Length != expectedLen)
+            throw new ArgumentException(
+                $"{(algo == HashAlgo.Sha1 ? "SHA-1" : "SHA-256")} 应为 {expectedLen} 位十六进制，当前 {hex.Length} 位");
+
+        return new ExpectedHash { Algo = algo, Hex = hex };
     }
 }
