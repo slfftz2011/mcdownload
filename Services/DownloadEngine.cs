@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Threading;
 using System.Threading.Tasks;
 using MCDownloader.Models;
@@ -11,9 +12,6 @@ namespace MCDownloader.Services;
 
 public class DownloadEngine
 {
-    // ── 整个进程只创建一个 HttpClient ──────────────────────────
-    // 反复 new HttpClient 会导致 socket 耗尽（TIME_WAIT 堆积），
-    // 所以用 static 字段共享一个实例，它是线程安全的。
     private static readonly HttpClient Client = CreateClient();
 
     private static HttpClient CreateClient()
@@ -22,139 +20,200 @@ public class DownloadEngine
         {
             AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate,
         };
-
         var client = new HttpClient(handler)
         {
-            // 大文件下载可能持续很久，不能让 HttpClient 自己超时。
-            // 什么时候放弃由 CancellationToken 控制。
             Timeout = Timeout.InfiniteTimeSpan,
         };
-
         client.DefaultRequestHeaders.UserAgent.ParseAdd("MCDownloader/0.1");
         return client;
     }
 
-    /// <summary>
-    /// 下载一个文件到 destPath。
-    /// - 流式写入，不占内存
-    /// - 通过 IProgress 报告进度（回调自动回到 UI 线程）
-    /// - 支持 CancellationToken 取消
-    /// - 先写 .part，校验大小后原子替换为目标文件
-    /// </summary>
     public async Task DownloadFileAsync(
         string url,
         string destPath,
         IProgress<DownloadProgress> progress,
         CancellationToken ct)
     {
-        // 1. 确保目标目录存在
         var dir = Path.GetDirectoryName(destPath);
         if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
             Directory.CreateDirectory(dir);
 
         var fileName = Path.GetFileName(destPath);
-        var partPath = destPath + ".part";   // 临时文件，下完再改名
+        var partPath = destPath + ".part";
 
-        long total = -1;   // 服务器返回的文件总大小，-1 表示未知
-
-        // 2. 发请求。注意 ResponseHeadersRead：
-        //    只等到响应头就返回，不把整个 body 读进内存。
-        //    （如果用默认的 ResponseContentRead，HttpClient 会先把
-        //      整个文件缓冲到内存里，几十 MB 的文件会直接卡死。）
-        using (var response = await Client
-            .GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct)
-            .ConfigureAwait(false))
+        // 外层循环：处理 416 后需要重试的情况
+        // 最多重试 1 次（416 → 删 .part → 重新请求）
+        for (int attempt = 0; attempt < 2; attempt++)
         {
-            response.EnsureSuccessStatusCode();
-            total = response.Content.Headers.ContentLength ?? -1L;
+            ct.ThrowIfCancellationRequested();
 
-            // 3. 拿到网络流
-            using (var src = await response.Content
-                .ReadAsStreamAsync()
-                .ConfigureAwait(false))
-            // 4. 打开本地文件流（Create 模式：每次都从头写）
-            using (var fs = new FileStream(
-                partPath,
-                FileMode.Create,
-                FileAccess.Write,
-                FileShare.None,
-                bufferSize: 81920,
-                useAsync: true))
+            long existing = File.Exists(partPath) ? new FileInfo(partPath).Length : 0;
+
+            // ── 构造请求，有 .part 就带 Range 头 ────────────
+            var request = new HttpRequestMessage(HttpMethod.Get, url);
+            if (existing > 0)
             {
-                var buffer = new byte[81920];
-                long received = 0;
-
-                // 用于计算速度
-                var sw = Stopwatch.StartNew();
-                long lastBytes = 0;
-                var lastReport = TimeSpan.Zero;
-
-                // 5. 循环：读一块 → 写一块 → 报告进度
-                while (true)
+                request.Headers.Range = new RangeHeaderValue(existing, null);
+                progress?.Report(new DownloadProgress
                 {
-                    ct.ThrowIfCancellationRequested();
+                    FileName = fileName,
+                    CurrentBytes = existing,
+                    TotalBytes = 0,
+                    Percent = 0,
+                    Speed = "",
+                    Status = $"检测到未完成下载 ({FormatSize(existing)})，尝试续传...",
+                });
+            }
 
-                    int read = await src
-                        .ReadAsync(buffer, 0, buffer.Length, ct)
-                        .ConfigureAwait(false);
+            using (var response = await Client
+                .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct)
+                .ConfigureAwait(false))
+            {
+                // ── 416：.part 已经够了 ─────────────────────
+                if (response.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
+                {
+                    var totalFromHeader = response.Content.Headers.ContentRange?.Length;
 
-                    if (read == 0) break;   // 读到 0 表示流结束
-
-                    await fs
-                        .WriteAsync(buffer, 0, read, ct)
-                        .ConfigureAwait(false);
-
-                    received += read;
-
-                    // 6. 进度节流：每 120ms 报告一次
-                    //    如果每次 read 都 Report，UI 线程会被每秒几千次的
-                    //    回调淹没，界面反而卡。120ms 约等于 8 次/秒，足够流畅。
-                    var now = sw.Elapsed;
-                    if (now - lastReport >= TimeSpan.FromMilliseconds(120)
-                        || (total > 0 && received == total))
+                    if (existing > 0 && totalFromHeader == existing)
                     {
-                        var dt = (now - lastReport).TotalSeconds;
-                        var speed = dt > 0 ? (received - lastBytes) / dt : 0;
-
+                        // .part 已完整，直接改名
+                        if (File.Exists(destPath)) File.Delete(destPath);
+                        File.Move(partPath, destPath);
                         progress?.Report(new DownloadProgress
                         {
                             FileName = fileName,
-                            CurrentBytes = received,
-                            TotalBytes = total,
-                            Percent = total > 0 ? (double)received / total * 100.0 : 0,
-                            Speed = HumanSpeed(speed),
-                            Status = "下载中",
+                            CurrentBytes = existing,
+                            TotalBytes = existing,
+                            Percent = 100,
+                            Speed = "0 B/s",
+                            Status = "完成（续传校验通过）",
                         });
-
-                        lastReport = now;
-                        lastBytes = received;
+                        return;
                     }
+
+                    // .part 比远端还大 / 远端变小 → 删掉重来
+                    File.Delete(partPath);
+                    continue;   // 重试
                 }
 
-                fs.Flush();
+                response.EnsureSuccessStatusCode();
+
+                // ── 判断服务器是否真正接受了 Range ───────────
+                bool resumed = response.StatusCode == HttpStatusCode.PartialContent;
+
+                if (!resumed && existing > 0)
+                {
+                    // 服务器返回 200 → 忽略 Range，只能从头下
+                    existing = 0;
+                }
+
+                // ── 计算总大小 ──────────────────────────────
+                long total = -1;
+                if (resumed)
+                {
+                    // 206 的 Content-Length 是「剩余部分」的长度
+                    var remaining = response.Content.Headers.ContentLength;
+                    if (remaining.HasValue)
+                        total = existing + remaining.Value;
+                }
+                else
+                {
+                    total = response.Content.Headers.ContentLength ?? -1L;
+                }
+
+                // ── 打开文件流 ──────────────────────────────
+                using (var src = await response.Content
+                    .ReadAsStreamAsync()
+                    .ConfigureAwait(false))
+                using (var fs = new FileStream(
+                    partPath,
+                    resumed ? FileMode.Append : FileMode.Create,
+                    FileAccess.Write,
+                    FileShare.None,
+                    bufferSize: 81920,
+                    useAsync: true))
+                {
+                    var buffer = new byte[81920];
+                    long received = existing;
+
+                    var sw = Stopwatch.StartNew();
+                    long lastBytes = existing;
+                    var lastReport = TimeSpan.Zero;
+
+                    while (true)
+                    {
+                        ct.ThrowIfCancellationRequested();
+
+                        int read = await src
+                            .ReadAsync(buffer, 0, buffer.Length, ct)
+                            .ConfigureAwait(false);
+                        if (read == 0) break;
+
+                        await fs
+                            .WriteAsync(buffer, 0, read, ct)
+                            .ConfigureAwait(false);
+
+                        received += read;
+
+                        var now = sw.Elapsed;
+                        if (now - lastReport >= TimeSpan.FromMilliseconds(120)
+                            || (total > 0 && received == total))
+                        {
+                            var dt = (now - lastReport).TotalSeconds;
+                            var speed = dt > 0 ? (received - lastBytes) / dt : 0;
+
+                            progress?.Report(new DownloadProgress
+                            {
+                                FileName = fileName,
+                                CurrentBytes = received,
+                                TotalBytes = total,
+                                Percent = total > 0 ? (double)received / total * 100.0 : 0,
+                                Speed = HumanSpeed(speed),
+                                Status = resumed ? "续传中" : "下载中",
+                            });
+
+                            lastReport = now;
+                            lastBytes = received;
+                        }
+                    }
+
+                    fs.Flush();
+                }
+
+                // ── 大小校验 ────────────────────────────────
+                var actual = new FileInfo(partPath).Length;
+                if (total > 0 && actual != total)
+                    throw new IOException(
+                        $"大小不匹配: 期望 {total} 字节，实际 {actual} 字节");
+
+                // ── .part → 目标文件 ────────────────────────
+                if (File.Exists(destPath)) File.Delete(destPath);
+                File.Move(partPath, destPath);
+
+                progress?.Report(new DownloadProgress
+                {
+                    FileName = fileName,
+                    CurrentBytes = actual,
+                    TotalBytes = actual,
+                    Percent = 100,
+                    Speed = "0 B/s",
+                    Status = "完成",
+                });
+                return;
             }
         }
 
-        // 7. 大小校验：服务器给了 Content-Length 就核对一下
-        var actual = new FileInfo(partPath).Length;
-        if (total > 0 && actual != total)
-            throw new IOException($"大小不匹配: 期望 {total} 字节，实际 {actual} 字节");
+        // 循环跑完还没 return，说明 416 重试也没救回来
+        throw new IOException("续传失败：.part 与远端不一致，已放弃");
+    }
 
-        // 8. .part → 目标文件
-        //    File.Move 在同一磁盘上是原子操作，中途崩溃不会留下半个目标文件
-        if (File.Exists(destPath)) File.Delete(destPath);
-        File.Move(partPath, destPath);
-
-        // 9. 最后再报告一次 100%
-        progress?.Report(new DownloadProgress
-        {
-            FileName = fileName,
-            CurrentBytes = actual,
-            TotalBytes = actual,
-            Percent = 100,
-            Speed = "0 B/s",
-            Status = "完成",
-        });
+    private static string FormatSize(long bytes)
+    {
+        string[] units = { "B", "KB", "MB", "GB" };
+        double v = bytes;
+        int i = 0;
+        while (v >= 1024 && i < units.Length - 1) { v /= 1024; i++; }
+        return $"{v:0.0} {units[i]}";
     }
 
     private static string HumanSpeed(double bytesPerSec)
@@ -162,11 +221,7 @@ public class DownloadEngine
         string[] units = { "B/s", "KB/s", "MB/s", "GB/s" };
         var v = bytesPerSec;
         int i = 0;
-        while (v >= 1024 && i < units.Length - 1)
-        {
-            v /= 1024;
-            i++;
-        }
+        while (v >= 1024 && i < units.Length - 1) { v /= 1024; i++; }
         return $"{v:0.0} {units[i]}";
     }
 }
