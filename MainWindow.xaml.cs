@@ -51,7 +51,7 @@ public partial class MainWindow : Window
         {
             DetailTitle.Text = $"{item.Id} · {item.Kind}";
             DetailSub.Text = item.Summary;
-            InstallBtn.IsEnabled = true;
+            InstallBtn.IsEnabled = _cts == null;
         }
     }
 
@@ -64,7 +64,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        // 骨架阶段仍用 manifest 测试，后续替换为完整 install 流程
+        // 骨架阶段：拿 manifest 当测试目标，后续替换为完整 install 流程
         var testUrl = "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json";
         var dest = Path.Combine("downloads", item.Id, "version_manifest.json");
         await RunDownloadAsync(testUrl, dest, null);
@@ -78,12 +78,13 @@ public partial class MainWindow : Window
             return;
         }
 
-        var url = CustomUrlBox.Text?.Trim();
+        var url = CustomUrlBox.Text == null ? "" : CustomUrlBox.Text.Trim();
         if (string.IsNullOrWhiteSpace(url))
         {
             StatusText.Text = "请输入下载地址";
             return;
         }
+
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)
             || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
         {
@@ -107,7 +108,31 @@ public partial class MainWindow : Window
         await RunDownloadAsync(url, dest, expected);
     }
 
-    private async System.Threading.Tasks.Task RunDownloadAsync(string url, string destPath)
+    private void HashAlgoBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (HashHexBox == null) return;
+        HashHexBox.IsEnabled = HashAlgoBox.SelectedIndex > 0;
+    }
+
+    private ExpectedHash BuildExpectedHash()
+    {
+        if (HashAlgoBox.SelectedIndex <= 0) return null;
+
+        var hex = HashHexBox.Text == null ? "" : HashHexBox.Text.Trim().ToLowerInvariant();
+        if (string.IsNullOrEmpty(hex)) return null;
+
+        var algo = HashAlgoBox.SelectedIndex == 1 ? HashAlgo.Sha1 : HashAlgo.Sha256;
+        var expectedLen = algo == HashAlgo.Sha1 ? 40 : 64;
+
+        if (hex.Length != expectedLen)
+            throw new ArgumentException(
+                $"{(algo == HashAlgo.Sha1 ? "SHA-1" : "SHA-256")} 应为 {expectedLen} 位十六进制，当前 {hex.Length} 位");
+
+        return new ExpectedHash { Algo = algo, Hex = hex };
+    }
+
+    private async System.Threading.Tasks.Task RunDownloadAsync(
+        string url, string destPath, ExpectedHash expected)
     {
         CustomDownloadBtn.IsEnabled = false;
         InstallBtn.IsEnabled = false;
@@ -120,7 +145,10 @@ public partial class MainWindow : Window
         {
             MainProgress.Value = p.Percent;
             ProgressText.Text = $"{p.FileName} · {p.Status} · {p.Speed}";
-            StatusText.Text = $"{p.CurrentBytes:N0}/{p.TotalBytes:N0} 字节";
+            if (p.TotalBytes > 0)
+                StatusText.Text = $"{p.CurrentBytes:N0}/{p.TotalBytes:N0} 字节";
+            else
+                StatusText.Text = $"{p.CurrentBytes:N0} 字节";
         });
 
         var engine = new DownloadEngine();
@@ -144,8 +172,11 @@ public partial class MainWindow : Window
         {
             CustomDownloadBtn.IsEnabled = true;
             InstallBtn.IsEnabled = VersionList.SelectedItem is NewsItem;
-            _cts?.Dispose();
-            _cts = null;
+            if (_cts != null)
+            {
+                _cts.Dispose();
+                _cts = null;
+            }
         }
     }
 
@@ -157,7 +188,6 @@ public partial class MainWindow : Window
 
         name = Uri.UnescapeDataString(name);
 
-        // 去掉可能残留的非法字符
         foreach (var c in Path.GetInvalidFileNameChars())
             name = name.Replace(c, '_');
 
@@ -166,7 +196,8 @@ public partial class MainWindow : Window
 
     private void FloatBtn_Click(object sender, RoutedEventArgs e)
     {
-        _ball ??= new FloatingBallWindow(this);
+        if (_ball == null)
+            _ball = new FloatingBallWindow(this);
         _ball.Show();
         Hide();
     }
@@ -175,29 +206,6 @@ public partial class MainWindow : Window
     {
         Show();
         Activate();
-        _ball?.Hide();
-    }
-
-    private void HashAlgoBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
-    {
-        if (HashHexBox == null) return;
-        HashHexBox.IsEnabled = HashAlgoBox.SelectedIndex > 0;
-    }
-
-    private ExpectedHash BuildExpectedHash()
-    {
-        if (HashAlgoBox.SelectedIndex <= 0) return null;
-
-        var hex = (HashHexBox.Text ?? "").Trim().ToLowerInvariant();
-        if (string.IsNullOrEmpty(hex)) return null;
-
-        var algo = HashAlgoBox.SelectedIndex == 1 ? HashAlgo.Sha1 : HashAlgo.Sha256;
-        var expectedLen = algo == HashAlgo.Sha1 ? 40 : 64;
-
-        if (hex.Length != expectedLen)
-            throw new ArgumentException(
-                $"{(algo == HashAlgo.Sha1 ? "SHA-1" : "SHA-256")} 应为 {expectedLen} 位十六进制，当前 {hex.Length} 位");
-
-        return new ExpectedHash { Algo = algo, Hex = hex };
+        if (_ball != null) _ball.Hide();
     }
 }

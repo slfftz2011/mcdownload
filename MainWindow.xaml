@@ -1,7 +1,7 @@
 <Window x:Class="MCDownloader.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="MCDownloader" Height="680" Width="960"
+        Title="MCDownloader" Height="700" Width="980"
         WindowStartupLocation="CenterScreen"
         Background="#1E1E2E">
 
@@ -77,14 +77,13 @@
                             BorderThickness="0" FontWeight="SemiBold"
                             Click="InstallBtn_Click" IsEnabled="False"/>
 
-                    <!-- 分隔 -->
                     <Border Height="1" Background="{StaticResource Divider}" Margin="0,20,0,0"/>
 
                     <!-- 自定义高速下载 -->
                     <TextBlock Text="自定义高速下载"
                                Foreground="{StaticResource TextPrimary}"
                                FontSize="14" FontWeight="SemiBold" Margin="0,16,0,4"/>
-                    <TextBlock Text="粘贴任意 http/https 直链，支持大文件分块下载"
+                    <TextBlock Text="粘贴任意 http/https 直链，支持大文件分块下载与哈希校验"
                                Foreground="{StaticResource TextSecondary}"
                                FontSize="11" Margin="0,0,0,8"/>
 
@@ -109,6 +108,30 @@
                                 Click="CustomDownloadBtn_Click"/>
                     </Grid>
 
+                    <!-- 哈希校验 -->
+                    <Grid Margin="0,8,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <ComboBox x:Name="HashAlgoBox" Grid.Column="0" Width="110"
+                                  SelectionChanged="HashAlgoBox_SelectionChanged">
+                            <ComboBoxItem Content="不校验" IsSelected="True"/>
+                            <ComboBoxItem Content="SHA-1"/>
+                            <ComboBoxItem Content="SHA-256"/>
+                        </ComboBox>
+                        <TextBox x:Name="HashHexBox" Grid.Column="1" Margin="8,0,0,0"
+                                 Padding="10,6"
+                                 Background="{StaticResource InputBg}"
+                                 Foreground="{StaticResource TextPrimary}"
+                                 BorderBrush="{StaticResource Divider}"
+                                 BorderThickness="1"
+                                 VerticalContentAlignment="Center"
+                                 FontSize="12"
+                                 IsEnabled="False"
+                                 ToolTip="粘贴完整十六进制哈希"/>
+                    </Grid>
+
                     <!-- 进度 -->
                     <ProgressBar x:Name="MainProgress" Height="6" Margin="0,24,0,0"
                                  Foreground="{StaticResource Accent}"
@@ -118,29 +141,6 @@
                                Foreground="{StaticResource TextSecondary}" FontSize="12"/>
                 </StackPanel>
             </Border>
-
-            <Grid Margin="0,8,0,0">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto"/>
-                    <ColumnDefinition Width="*"/>
-                </Grid.ColumnDefinitions>
-                <ComboBox x:Name="HashAlgoBox" Grid.Column="0" Width="110"
-                        SelectionChanged="HashAlgoBox_SelectionChanged">
-                    <ComboBoxItem Content="不校验" IsSelected="True"/>
-                    <ComboBoxItem Content="SHA-1"/>
-                    <ComboBoxItem Content="SHA-256"/>
-                </ComboBox>
-                <TextBox x:Name="HashHexBox" Grid.Column="1" Margin="8,0,0,0"
-                        Padding="10,6"
-                        Background="{StaticResource InputBg}"
-                        Foreground="{StaticResource TextPrimary}"
-                        BorderBrush="{StaticResource Divider}"
-                        BorderThickness="1"
-                        VerticalContentAlignment="Center"
-                        FontSize="12"
-                        IsEnabled="False"
-                        ToolTip="粘贴完整十六进制哈希"/>
-            </Grid>
         </Grid>
 
         <!-- 底部状态栏 -->
