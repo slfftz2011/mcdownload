@@ -1,7 +1,7 @@
 <Window x:Class="MCDownloader.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="MCDownloader" Height="620" Width="960"
+        Title="MCDownloader" Height="680" Width="960"
         WindowStartupLocation="CenterScreen"
         Background="#1E1E2E">
 
@@ -10,6 +10,8 @@
         <SolidColorBrush x:Key="Accent" Color="#7C9EFF"/>
         <SolidColorBrush x:Key="TextPrimary" Color="#EAEAF0"/>
         <SolidColorBrush x:Key="TextSecondary" Color="#9A9AB0"/>
+        <SolidColorBrush x:Key="InputBg" Color="#1E1E2E"/>
+        <SolidColorBrush x:Key="Divider" Color="#3A3A50"/>
 
         <Style TargetType="Border" x:Key="CardBorder">
             <Setter Property="Background" Value="{StaticResource CardBg}"/>
@@ -30,7 +32,6 @@
             <RowDefinition Height="48"/>
         </Grid.RowDefinitions>
 
-        <!-- 主内容：左新闻流 + 右详情 -->
         <Grid Grid.Row="0" Margin="8">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="360"/>
@@ -61,7 +62,7 @@
                 </DockPanel>
             </Border>
 
-            <!-- 右侧：详情与操作 -->
+            <!-- 右侧：详情 + 自定义下载 + 进度 -->
             <Border Grid.Column="1" Style="{StaticResource CardBorder}">
                 <StackPanel>
                     <TextBlock x:Name="DetailTitle" Text="选择一个版本"
@@ -76,10 +77,43 @@
                             BorderThickness="0" FontWeight="SemiBold"
                             Click="InstallBtn_Click" IsEnabled="False"/>
 
-                    <ProgressBar x:Name="MainProgress" Height="6" Margin="0,28,0,0"
-                                 Foreground="{StaticResource Accent}"
-                                 Background="#3A3A50" BorderThickness="0"/>
+                    <!-- 分隔 -->
+                    <Border Height="1" Background="{StaticResource Divider}" Margin="0,20,0,0"/>
 
+                    <!-- 自定义高速下载 -->
+                    <TextBlock Text="自定义高速下载"
+                               Foreground="{StaticResource TextPrimary}"
+                               FontSize="14" FontWeight="SemiBold" Margin="0,16,0,4"/>
+                    <TextBlock Text="粘贴任意 http/https 直链，支持大文件分块下载"
+                               Foreground="{StaticResource TextSecondary}"
+                               FontSize="11" Margin="0,0,0,8"/>
+
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBox x:Name="CustomUrlBox" Grid.Column="0"
+                                 Padding="10,6"
+                                 Background="{StaticResource InputBg}"
+                                 Foreground="{StaticResource TextPrimary}"
+                                 BorderBrush="{StaticResource Divider}"
+                                 BorderThickness="1"
+                                 VerticalContentAlignment="Center"
+                                 FontSize="13"/>
+                        <Button x:Name="CustomDownloadBtn" Grid.Column="1"
+                                Content="下载" Margin="8,0,0,0"
+                                Padding="20,6"
+                                Background="{StaticResource Accent}" Foreground="#1E1E2E"
+                                BorderThickness="0" FontWeight="SemiBold"
+                                Click="CustomDownloadBtn_Click"/>
+                    </Grid>
+
+                    <!-- 进度 -->
+                    <ProgressBar x:Name="MainProgress" Height="6" Margin="0,24,0,0"
+                                 Foreground="{StaticResource Accent}"
+                                 Background="{StaticResource Divider}"
+                                 BorderThickness="0"/>
                     <TextBlock x:Name="ProgressText" Margin="0,8,0,0"
                                Foreground="{StaticResource TextSecondary}" FontSize="12"/>
                 </StackPanel>
