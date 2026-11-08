@@ -6,7 +6,6 @@
     <UseWPF>true</UseWPF>
     <RootNamespace>MCDownloader</RootNamespace>
     <AssemblyName>MCDownloader</AssemblyName>
-    <ApplicationIcon />
     <LangVersion>latest</LangVersion>
 
     <OutputPath>bin\Release\</OutputPath>
@@ -16,6 +15,10 @@
 
   <ItemGroup>
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="System.Net.Http" />
   </ItemGroup>
 
 </Project>

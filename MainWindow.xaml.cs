@@ -13,9 +13,9 @@ namespace MCDownloader;
 public partial class MainWindow : Window
 {
     private readonly ObservableCollection<NewsItem> _news = new();
-    private FloatingBallWindow? _ball;
+    private FloatingBallWindow _ball;
     private readonly LocalHttpService _http = new();
-    private CancellationTokenSource? _cts;
+    private CancellationTokenSource _cts;
 
     public MainWindow()
     {
