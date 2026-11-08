@@ -1,0 +1,8 @@
+<Application x:Class="MCDownloader.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             StartupUri="MainWindow.xaml">
+    <Application.Resources>
+        <!-- 全局资源可以放这里，跨窗口共享的画笔、样式、转换器 -->
+    </Application.Resources>
+</Application>

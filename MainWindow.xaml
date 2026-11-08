@@ -1,0 +1,104 @@
+<Window x:Class="MCDownloader.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="MCDownloader" Height="620" Width="960"
+        WindowStartupLocation="CenterScreen"
+        Background="#1E1E2E">
+
+    <Window.Resources>
+        <SolidColorBrush x:Key="CardBg" Color="#2A2A3C"/>
+        <SolidColorBrush x:Key="Accent" Color="#7C9EFF"/>
+        <SolidColorBrush x:Key="TextPrimary" Color="#EAEAF0"/>
+        <SolidColorBrush x:Key="TextSecondary" Color="#9A9AB0"/>
+
+        <Style TargetType="Border" x:Key="CardBorder">
+            <Setter Property="Background" Value="{StaticResource CardBg}"/>
+            <Setter Property="CornerRadius" Value="10"/>
+            <Setter Property="Padding" Value="16"/>
+            <Setter Property="Margin" Value="8"/>
+            <Setter Property="Effect">
+                <Setter.Value>
+                    <DropShadowEffect BlurRadius="12" ShadowDepth="2" Opacity="0.25" Color="Black"/>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="48"/>
+        </Grid.RowDefinitions>
+
+        <!-- 主内容：左新闻流 + 右详情 -->
+        <Grid Grid.Row="0" Margin="8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="360"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- 左侧：版本新闻流 -->
+            <Border Grid.Column="0" Style="{StaticResource CardBorder}">
+                <DockPanel>
+                    <TextBlock DockPanel.Dock="Top" Text="版本动态"
+                               Foreground="{StaticResource TextPrimary}"
+                               FontSize="16" FontWeight="SemiBold" Margin="0,0,0,12"/>
+                    <ListBox x:Name="VersionList"
+                             Background="Transparent" BorderThickness="0"
+                             Foreground="{StaticResource TextPrimary}"
+                             SelectionChanged="VersionList_SelectionChanged"
+                             ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <StackPanel Margin="0,4">
+                                    <TextBlock Text="{Binding Title}" FontWeight="SemiBold"/>
+                                    <TextBlock Text="{Binding Summary}" FontSize="11"
+                                               Foreground="{StaticResource TextSecondary}" Margin="0,2,0,0"/>
+                                </StackPanel>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                </DockPanel>
+            </Border>
+
+            <!-- 右侧：详情与操作 -->
+            <Border Grid.Column="1" Style="{StaticResource CardBorder}">
+                <StackPanel>
+                    <TextBlock x:Name="DetailTitle" Text="选择一个版本"
+                               Foreground="{StaticResource TextPrimary}"
+                               FontSize="20" FontWeight="Bold"/>
+                    <TextBlock x:Name="DetailSub" Margin="0,6,0,0"
+                               Foreground="{StaticResource TextSecondary}"/>
+
+                    <Button x:Name="InstallBtn" Content="安装此版本"
+                            Margin="0,24,0,0" Padding="24,8" HorizontalAlignment="Left"
+                            Background="{StaticResource Accent}" Foreground="#1E1E2E"
+                            BorderThickness="0" FontWeight="SemiBold"
+                            Click="InstallBtn_Click" IsEnabled="False"/>
+
+                    <ProgressBar x:Name="MainProgress" Height="6" Margin="0,28,0,0"
+                                 Foreground="{StaticResource Accent}"
+                                 Background="#3A3A50" BorderThickness="0"/>
+
+                    <TextBlock x:Name="ProgressText" Margin="0,8,0,0"
+                               Foreground="{StaticResource TextSecondary}" FontSize="12"/>
+                </StackPanel>
+            </Border>
+        </Grid>
+
+        <!-- 底部状态栏 -->
+        <Border Grid.Row="1" Background="#161622" Padding="16,0">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock x:Name="StatusText" VerticalAlignment="Center"
+                           Foreground="{StaticResource TextSecondary}" FontSize="12"/>
+                <Button Grid.Column="1" Content="悬浮球" Padding="16,4"
+                        Background="#2A2A3C" Foreground="{StaticResource TextSecondary}"
+                        BorderThickness="0" Click="FloatBtn_Click"/>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>
