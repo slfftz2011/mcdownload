@@ -20,9 +20,9 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
     io::stdout,
     path::PathBuf,
-    sync::mpsc,
     time::Duration,
 };
+use tokio::sync::mpsc;
 
 fn main() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;

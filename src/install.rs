@@ -7,7 +7,7 @@ use crate::version::{collect_libraries, VersionJson};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use tokio::sync::mpsc;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 

@@ -1,6 +1,5 @@
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
-use indicatif::{ProgressBar, ProgressStyle};
 use sha2::Digest as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -64,9 +63,7 @@ enum ProbeResult {
 #[derive(Clone)]
 pub struct Downloader {
     client: reqwest::Client,
-    /// 全局并发上限：单文件下载持 1 个，分块下载每个块持 1 个
     sem: Arc<Semaphore>,
-    progress: Option<Arc<ProgressBar>>,
     quiet: bool,
     chunk_size: u64,
     seg_threshold: u64,
@@ -81,16 +78,10 @@ impl Downloader {
         Self {
             client,
             sem: Arc::new(Semaphore::new(concurrency.max(1))),
-            progress: None,
             quiet,
             chunk_size: 4 * 1024 * 1024,
             seg_threshold: 8 * 1024 * 1024,
         }
-    }
-
-    pub fn with_progress(mut self, pb: Arc<ProgressBar>) -> Self {
-        self.progress = Some(pb);
-        self
     }
 
     pub fn with_chunking(mut self, chunk_size: u64, seg_threshold: u64) -> Self {
@@ -105,40 +96,30 @@ impl Downloader {
         dest: &Path,
         expected: Option<ExpectedHash>,
     ) -> Result<()> {
-        // 已存在检查
         if dest.exists() {
             if let Some(ref exp) = expected {
                 if verify_file_hash(dest, exp.algo, &exp.hex).await.unwrap_or(false) {
-                    self.inc_progress();
                     return Ok(());
                 }
                 tokio::fs::remove_file(dest).await.ok();
             } else {
-                self.inc_progress();
                 return Ok(());
             }
         }
 
-        // 探测是否支持分块
         let segmented_total = match self.probe(url).await {
             Ok(ProbeResult::Segmented(total)) if total >= self.seg_threshold => Some(total),
             _ => None,
         };
 
-        let result = if let Some(total) = segmented_total {
+        if let Some(total) = segmented_total {
             self.do_download_segmented(url, dest, expected, total).await
         } else {
             let _permit = self.sem.acquire().await.context("获取并发许可失败")?;
             self.do_download_single(url, dest, expected).await
-        };
-
-        if result.is_ok() {
-            self.inc_progress();
         }
-        result
     }
 
-    /// 用 GET Range: bytes=0-0 探测；不读 body，直接 drop
     async fn probe(&self, url: &str) -> Result<ProbeResult> {
         let resp = self
             .client
@@ -161,8 +142,6 @@ impl Downloader {
         Ok(ProbeResult::Unknown)
     }
 
-    // ---------- 分块下载 ----------
-
     async fn do_download_segmented(
         &self,
         url: &str,
@@ -173,39 +152,18 @@ impl Downloader {
         let chunk_size = self.chunk_size;
         let num_chunks = (total + chunk_size - 1) / chunk_size;
 
-        // 单文件模式（url 命令）显示字节进度；批量模式（install）不显示
-        let inner_pb = if self.progress.is_none() && !self.quiet {
-            Some(Arc::new(new_bytes_bar(total, url)))
-        } else {
-            None
-        };
-
-        // 续传：把已有块大小累加进进度条初始值
-        if let Some(pb) = &inner_pb {
-            let mut initial = 0u64;
-            for i in 0..num_chunks {
-                let len = file_len(&chunk_path(dest, i))
-                    .await
-                    .min(chunk_len_at(i, total, chunk_size));
-                initial += len;
-            }
-            pb.set_position(initial);
-        }
-
-        // 并发下载所有块，每块占 1 个全局 permit
         let mut set = tokio::task::JoinSet::new();
         for i in 0..num_chunks {
             let client = self.client.clone();
             let sem = self.sem.clone();
             let url = url.to_string();
             let dest = dest.to_path_buf();
-            let pb = inner_pb.clone();
             set.spawn(async move {
                 let _permit = sem
                     .acquire()
                     .await
                     .map_err(|e| anyhow::anyhow!("获取许可失败: {e}"))?;
-                download_chunk(&client, &url, &dest, i, chunk_size, total, pb).await
+                download_chunk(&client, &url, &dest, i, chunk_size, total).await
             });
         }
 
@@ -227,24 +185,11 @@ impl Downloader {
         }
 
         if let Some(e) = first_err {
-            if let Some(pb) = inner_pb {
-                pb.finish_and_clear();
-            }
             return Err(e);
         }
 
-        let merge_result = merge_chunks(dest, num_chunks, expected).await;
-
-        if let Some(pb) = inner_pb {
-            match &merge_result {
-                Ok(()) => pb.finish_with_message(format!("✓ {url}")),
-                Err(_) => pb.finish_and_clear(),
-            }
-        }
-        merge_result
+        merge_chunks(dest, num_chunks, expected).await
     }
-
-    // ---------- 单线程下载（保留原有断点续传） ----------
 
     async fn do_download_single(
         &self,
@@ -297,11 +242,12 @@ impl Downloader {
                 .error_for_status()
                 .with_context(|| format!("服务器错误: {url}"))?;
             let resume = status == reqwest::StatusCode::PARTIAL_CONTENT;
-            let (total, start) = if resume {
-                (resp.content_length().map(|l| existing + l), existing)
+            let total = if resume {
+                resp.content_length().map(|l| existing + l)
             } else {
-                (resp.content_length(), 0)
+                resp.content_length()
             };
+            let start = if resume { existing } else { 0 };
 
             if !resume {
                 if let Some(e) = &expected {
@@ -321,12 +267,6 @@ impl Downloader {
                     .with_context(|| format!("创建片段失败: {}", part.display()))?
             };
 
-            let pb = if self.progress.is_none() && !self.quiet {
-                Some(new_progress_bar(total, url, start))
-            } else {
-                None
-            };
-
             let mut stream = resp.bytes_stream();
             let mut written = start;
             while let Some(chunk) = stream.next().await {
@@ -336,9 +276,6 @@ impl Downloader {
                     h.update(&chunk);
                 }
                 written += chunk.len() as u64;
-                if let Some(pb) = &pb {
-                    pb.set_position(written);
-                }
             }
             file.flush().await?;
             drop(file);
@@ -363,21 +300,10 @@ impl Downloader {
             }
 
             tokio::fs::rename(&part, dest).await?;
-            if let Some(pb) = pb {
-                pb.finish_and_clear();
-            }
             return Ok(());
         }
     }
-
-    fn inc_progress(&self) {
-        if let Some(pb) = &self.progress {
-            pb.inc(1);
-        }
-    }
 }
-
-// ---------- 块下载与合并 ----------
 
 async fn download_chunk(
     client: &reqwest::Client,
@@ -386,7 +312,6 @@ async fn download_chunk(
     index: u64,
     chunk_size: u64,
     total: u64,
-    pb: Option<Arc<ProgressBar>>,
 ) -> Result<()> {
     let start = index * chunk_size;
     let end_exclusive = (start + chunk_size).min(total);
@@ -395,14 +320,11 @@ async fn download_chunk(
 
     let existing = file_len(&chunk_path).await.min(chunk_len);
     if existing == chunk_len {
-        if let Some(pb) = &pb {
-            pb.inc(0); // 已在初始化时计入
-        }
         return Ok(());
     }
 
     let range_start = start + existing;
-    let range_end = end_exclusive - 1; // inclusive
+    let range_end = end_exclusive - 1;
 
     let resp = client
         .get(url)
@@ -440,9 +362,6 @@ async fn download_chunk(
         let chunk = chunk.with_context(|| format!("块 {index} 下载中断"))?;
         file.write_all(&chunk).await?;
         written += chunk.len() as u64;
-        if let Some(pb) = &pb {
-            pb.inc(chunk.len() as u64);
-        }
     }
     file.flush().await?;
 
@@ -452,7 +371,6 @@ async fn download_chunk(
     Ok(())
 }
 
-/// 顺序拼接所有块到 `.part`，顺便计算哈希，最后 rename 到 dest
 async fn merge_chunks(
     dest: &Path,
     num_chunks: u64,
@@ -500,22 +418,14 @@ async fn merge_chunks(
     for i in 0..num_chunks {
         tokio::fs::remove_file(chunk_path(dest, i)).await.ok();
     }
-    // 清掉可能的旧单线程 .part
     tokio::fs::remove_file(part_path(dest)).await.ok();
     Ok(())
 }
-
-// ---------- 工具函数 ----------
 
 fn chunk_path(dest: &Path, index: u64) -> PathBuf {
     let mut name = dest.file_name().map(|n| n.to_os_string()).unwrap_or_default();
     name.push(format!(".part.{index}"));
     dest.with_file_name(name)
-}
-
-fn chunk_len_at(index: u64, total: u64, chunk_size: u64) -> u64 {
-    let start = index * chunk_size;
-    (start + chunk_size).min(total) - start
 }
 
 fn part_path(dest: &Path) -> PathBuf {
@@ -530,7 +440,6 @@ async fn file_len(path: &Path) -> u64 {
 
 fn parse_content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     let value = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
-    // 形如 "bytes 0-0/12345" 或 "bytes */12345"
     value.rsplit('/').next()?.trim().parse().ok()
 }
 
@@ -560,48 +469,4 @@ async fn hash_prefix(path: &Path, algo: HashAlgo) -> Result<Hasher> {
         hasher.update(&buf[..n]);
     }
     Ok(hasher)
-}
-
-fn new_progress_bar(total: Option<u64>, url: &str, start: u64) -> ProgressBar {
-    match total {
-        Some(len) => {
-            let pb = ProgressBar::new(len);
-            pb.set_style(
-                ProgressStyle::with_template(
-                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] \
-                     {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-                )
-                .unwrap()
-                .progress_chars("=> "),
-            );
-            pb.set_position(start);
-            pb.set_message(url.to_string());
-            pb
-        }
-        None => {
-            let pb = ProgressBar::new_spinner();
-            pb.set_style(
-                ProgressStyle::with_template(
-                    "{spinner:.green} [{elapsed_precise}] {bytes} ({bytes_per_sec})",
-                )
-                .unwrap(),
-            );
-            pb.set_message(url.to_string());
-            pb
-        }
-    }
-}
-
-fn new_bytes_bar(total: u64, url: &str) -> ProgressBar {
-    let pb = ProgressBar::new(total);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] \
-             {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-        )
-        .unwrap()
-        .progress_chars("=> "),
-    );
-    pb.set_message(url.to_string());
-    pb
 }

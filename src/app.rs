@@ -1,6 +1,6 @@
 use crate::manifest::VersionEntry;
 use ratatui::widgets::ListState;
-use std::sync::mpsc;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
 pub struct NewsItem {
