@@ -1,245 +1,167 @@
+mod app;
 mod assets;
 mod downloader;
 mod install;
 mod manifest;
 mod mirror;
+mod ui;
 mod version;
 
-use anyhow::{bail, Context, Result};
-use downloader::{Downloader, ExpectedHash, HashAlgo};
+use anyhow::{Context, Result};
+use app::{App, Msg};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use manifest::VersionManifest;
 use mirror::MirrorConfig;
-use std::path::PathBuf;
+use ratatui::{backend::CrosstermBackend, Terminal};
+use std::{
+    io::stdout,
+    path::PathBuf,
+    sync::mpsc,
+    time::Duration,
+};
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() {
-        print_usage();
-        std::process::exit(1);
-    }
+fn main() -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
 
-    let (cmd, rest) = match args[0].as_str() {
-        "url" | "manifest" | "install" => (args[0].as_str(), &args[1..]),
-        _ => ("url", &args[..]),
-    };
+    enable_raw_mode()?;
+    let mut out = stdout();
+    execute!(out, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(out);
+    let mut terminal = Terminal::new(backend)?;
 
-    let (positional, flags) = parse_flags(rest)?;
-    let mirror = if flags.official {
-        MirrorConfig::official()
-    } else {
-        MirrorConfig::default()
-    };
+    let (tx, rx) = mpsc::unbounded_channel::<Msg>();
+    let mut app = App::new(tx.clone(), rx);
 
-    match cmd {
-        "url" => cmd_url(positional, &flags).await,
-        "manifest" => cmd_manifest(&mirror, &flags).await,
-        "install" => cmd_install(positional, &mirror, &flags).await,
-        _ => unreachable!(),
-    }
+    // 初始加载 manifest
+    spawn_load_manifest(&rt, tx.clone(), app.mirror_enabled);
+
+    let res = run_loop(&mut terminal, &mut app, &rt);
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    res
 }
 
-async fn cmd_url(pos: Vec<String>, _mirror: &MirrorConfig, flags: &Flags) -> Result<()> {
-    if pos.is_empty() {
-        bail!("用法: mc-downloader url [--sha1 X|--sha256 X] <URL> [输出]");
-    }
-    let url = &pos[0];
-    let dest = resolve_dest(url, pos.get(1))?;
-    if dest.exists() {
-        bail!("目标文件已存在: {}", dest.display());
-    }
-    if let Some(parent) = dest.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await?;
+fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
+    rt: &tokio::runtime::Runtime,
+) -> Result<()> {
+    loop {
+        terminal.draw(|f| ui::render(f, app))?;
+
+        // 阻塞式读键盘，带 120ms 超时
+        if event::poll(Duration::from_millis(120))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    handle_key(app, key.code, rt);
+                }
+            }
+        }
+
+        // 非阻塞消费 UI 消息
+        while let Ok(msg) = app.rx.try_recv() {
+            app.handle(msg);
+        }
+
+        if app.should_quit {
+            return Ok(());
         }
     }
-
-    let expected = if let Some(h) = flags.sha1.as_ref() {
-        Some(ExpectedHash {
-            algo: HashAlgo::Sha1,
-            hex: h.clone(),
-        })
-    } else {
-        flags.sha256.as_ref().map(|h| ExpectedHash {
-            algo: HashAlgo::Sha256,
-            hex: h.clone(),
-        })
-    };
-
-    let chunk_size = flags.chunk_size.unwrap_or(4 * 1024 * 1024);
-    let seg_threshold = flags.seg_threshold.unwrap_or(8 * 1024 * 1024);
-
-    let dl = Downloader::new(flags.concurrency, false)
-        .with_chunking(chunk_size, seg_threshold);
-
-    dl.download(url, &dest, expected).await?;
-
-    let size = tokio::fs::metadata(&dest).await?.len();
-    println!("完成: {} ({})", dest.display(), human_size(size));
-    Ok(())
 }
 
-async fn cmd_manifest(mirror: &MirrorConfig, flags: &Flags) -> Result<()> {
+fn handle_key(app: &mut App, code: KeyCode, rt: &tokio::runtime::Runtime) {
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Char('j') | KeyCode::Down => app.prev(), // 列表反向（最新在上）
+        KeyCode::Char('k') | KeyCode::Up => app.next(),
+        KeyCode::Char('r') => {
+            app.phase = app::Phase::Loading;
+            app.push_log("刷新清单...");
+            spawn_load_manifest(rt, app.tx.clone(), app.mirror_enabled);
+        }
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            app.concurrency = (app.concurrency + 2).min(64);
+            app.push_log(format!("并发 → {}", app.concurrency));
+        }
+        KeyCode::Char('-') => {
+            app.concurrency = app.concurrency.saturating_sub(2).max(1);
+            app.push_log(format!("并发 → {}", app.concurrency));
+        }
+        KeyCode::Enter => {
+            if app.phase != app::Phase::Ready {
+                app.push_log("当前状态不可安装");
+                return;
+            }
+            let Some(item) = app.selected().cloned() else {
+                return;
+            };
+            app.phase = app::Phase::Downloading;
+            app.progress_current = 0;
+            app.progress_total = 0;
+            app.push_log(format!("开始安装 {}", item.id));
+
+            let mirror = if app.mirror_enabled {
+                MirrorConfig::default()
+            } else {
+                MirrorConfig::official()
+            };
+            let base = PathBuf::from(&app.base_dir);
+            let id = item.id.clone();
+            let tx = app.tx.clone();
+            let conc = app.concurrency;
+            let cs = app.chunk_size;
+            let st = app.seg_threshold;
+
+            rt.spawn(async move {
+                let res = install::install(&id, &base, &mirror, conc, cs, st, Some(tx.clone()))
+                    .await
+                    .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(Msg::DownloadDone(res));
+            });
+        }
+        _ => {}
+    }
+}
+
+fn spawn_load_manifest(
+    rt: &tokio::runtime::Runtime,
+    tx: mpsc::UnboundedSender<Msg>,
+    mirror_enabled: bool,
+) {
+    rt.spawn(async move {
+        let mirror = if mirror_enabled {
+            MirrorConfig::default()
+        } else {
+            MirrorConfig::official()
+        };
+        match load_manifest(&mirror).await {
+            Ok(news) => {
+                let _ = tx.send(Msg::ManifestLoaded(news));
+            }
+            Err(e) => {
+                let _ = tx.send(Msg::Log(format!("加载失败: {e:#}")));
+            }
+        }
+    });
+}
+
+async fn load_manifest(mirror: &MirrorConfig) -> Result<Vec<app::NewsItem>> {
     let client = reqwest::Client::new();
     let resp = client
         .get(&mirror.version_manifest)
         .send()
-        .await?
+        .await
+        .context("请求 manifest 失败")?
         .error_for_status()?;
     let mut json: serde_json::Value = resp.json().await?;
     mirror.rewrite_version_manifest(&mut json)?;
     let bytes = serde_json::to_vec(&json)?;
     let manifest = VersionManifest::from_slice(&bytes)?;
-
-    println!("最新 release: {}", manifest.latest.release);
-    println!("最新 snapshot: {}", manifest.latest.snapshot);
-    println!("共 {} 个版本:", manifest.versions.len());
-    let limit = flags.limit.unwrap_or(manifest.versions.len());
-    for v in manifest.versions.iter().take(limit) {
-        println!("  {:<16} {:<12} {}", v.id, v.kind, v.release_time);
-    }
-    if limit < manifest.versions.len() {
-        println!("  ...（省略 {} 条）", manifest.versions.len() - limit);
-    }
-    Ok(())
-}
-
-async fn cmd_install(pos: Vec<String>, mirror: &MirrorConfig, flags: &Flags) -> Result<()> {
-    let version = pos.first().map(String::as_str).unwrap_or("latest");
-    let base = flags
-        .dir
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("minecraft"));
-    let chunk_size = flags.chunk_size.unwrap_or(4 * 1024 * 1024);
-    let seg_threshold = flags.seg_threshold.unwrap_or(8 * 1024 * 1024);
-    install::install(
-        version,
-        &base,
-        mirror,
-        flags.concurrency,
-        chunk_size,
-        seg_threshold,
-    )
-    .await
-}
-
-struct Flags {
-    official: bool,
-    concurrency: usize,
-    limit: Option<usize>,
-    dir: Option<String>,
-    sha1: Option<String>,
-    sha256: Option<String>,
-    chunk_size: Option<u64>,
-    seg_threshold: Option<u64>,
-}
-
-fn parse_flags(args: &[String]) -> Result<(Vec<String>, Flags)> {
-    let mut pos = Vec::new();
-    let mut flags = Flags {
-        official: false,
-        concurrency: 16,
-        limit: None,
-        dir: None,
-        sha1: None,
-        sha256: None,
-        chunk_size: None,
-        seg_threshold: None,
-    };
-    let mut i = 0;
-    while i < args.len() {
-        let a = &args[i];
-        match a.as_str() {
-            "--official" => flags.official = true,
-            "-c" | "--concurrency" => {
-                i += 1;
-                flags.concurrency = args.get(i).context("-c 需要一个数值")?.parse()?;
-            }
-            "--limit" => {
-                i += 1;
-                flags.limit = Some(args.get(i).context("--limit 需要一个数值")?.parse()?);
-            }
-            "-d" | "--dir" => {
-                i += 1;
-                flags.dir = Some(args.get(i).context("-d 需要一个路径")?.clone());
-            }
-            "--sha1" => {
-                i += 1;
-                flags.sha1 = Some(args.get(i).context("--sha1 需要一个值")?.to_lowercase());
-            }
-            "--sha256" => {
-                i += 1;
-                flags.sha256 = Some(args.get(i).context("--sha256 需要一个值")?.to_lowercase());
-            }
-            "--chunk-size" => {
-                i += 1;
-                let mb: u64 = args.get(i).context("--chunk-size 需要 MB 数")?.parse()?;
-                flags.chunk_size = Some(mb * 1024 * 1024);
-            }
-            "--seg-threshold" => {
-                i += 1;
-                let mb: u64 = args.get(i).context("--seg-threshold 需要 MB 数")?.parse()?;
-                flags.seg_threshold = Some(mb * 1024 * 1024);
-            }
-            "-h" | "--help" => {
-                print_usage();
-                std::process::exit(0);
-            }
-            s if s.starts_with('-') => bail!("未知参数: {s}"),
-            s => pos.push(s.to_string()),
-        }
-        i += 1;
-    }
-    if flags.sha1.is_some() && flags.sha256.is_some() {
-        bail!("--sha1 与 --sha256 不能同时指定");
-    }
-    Ok((pos, flags))
-}
-
-fn resolve_dest(url: &str, arg: Option<&String>) -> Result<PathBuf> {
-    let name = url
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .last()
-        .and_then(|s| s.split('?').next())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    match arg {
-        None => Ok(PathBuf::from(name.context("无法从 URL 推断文件名")?)),
-        Some(p) => {
-            let path = PathBuf::from(p);
-            if p.ends_with('/') || path.is_dir() {
-                Ok(path.join(name.context("目标为目录，但 URL 无文件名")?))
-            } else {
-                Ok(path)
-            }
-        }
-    }
-}
-
-fn print_usage() {
-    eprintln!("用法:");
-    eprintln!("  mc-downloader url [--sha1 X|--sha256 X] [--chunk-size MB] [--seg-threshold MB] <URL> [输出]");
-    eprintln!("  mc-downloader manifest [--limit N] [--official]");
-    eprintln!("  mc-downloader install [版本ID|latest] [-d 目录] [-c 并发数] [--chunk-size MB] [--seg-threshold MB] [--official]");
-    eprintln!();
-    eprintln!("参数:");
-    eprintln!("  --official          使用官方源（默认走 BMCLAPI 镜像）");
-    eprintln!("  -c <N>              全局并发上限，默认 16");
-    eprintln!("  -d <DIR>            安装目录，默认 ./minecraft");
-    eprintln!("  --limit <N>         manifest 列表显示条数");
-    eprintln!("  --chunk-size <MB>   分块大小，默认 4 MB");
-    eprintln!("  --seg-threshold <MB> 分块阈值，低于此值不分块，默认 8 MB");
-}
-
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut size = bytes as f64;
-    let mut idx = 0;
-    while size >= 1024.0 && idx < UNITS.len() - 1 {
-        size /= 1024.0;
-        idx += 1;
-    }
-    format!("{:.2} {}", size, UNITS[idx])
+    Ok(app::news_from_entries(manifest.versions))
 }

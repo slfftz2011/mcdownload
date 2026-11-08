@@ -1,11 +1,13 @@
+use crate::app::Msg;
 use crate::assets::AssetIndex;
 use crate::downloader::{Downloader, ExpectedHash, HashAlgo};
 use crate::manifest::VersionManifest;
 use crate::mirror::MirrorConfig;
 use crate::version::{collect_libraries, VersionJson};
 use anyhow::{Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -16,12 +18,19 @@ pub async fn install(
     concurrency: usize,
     chunk_size: u64,
     seg_threshold: u64,
+    tx: Option<mpsc::UnboundedSender<Msg>>,
 ) -> Result<()> {
-    println!("目标目录: {}", base_dir.display());
-    println!("版本: {}", version_id);
+    let send = |msg: Msg| {
+        if let Some(t) = &tx {
+            let _ = t.send(msg);
+        }
+    };
+
+    send(Msg::Log(format!("目标目录: {}", base_dir.display())));
+    send(Msg::Log(format!("版本: {version_id}")));
 
     // 1. manifest
-    println!("获取版本清单...");
+    send(Msg::Log("获取版本清单...".into()));
     let manifest_url = mirror.version_manifest.clone();
     let manifest_bytes = http_get(&manifest_url).await?;
     let mut manifest_json: serde_json::Value =
@@ -30,7 +39,10 @@ pub async fn install(
     let manifest = VersionManifest::from_slice(&serde_json::to_vec(&manifest_json)?)?;
 
     let entry = manifest.resolve(version_id)?.clone();
-    println!("解析到版本: {} ({})", entry.id, entry.kind);
+    send(Msg::Log(format!(
+        "解析到版本: {} ({})",
+        entry.id, entry.kind
+    )));
 
     // 2. version.json
     let version_bytes = http_get(&entry.url).await?;
@@ -47,6 +59,7 @@ pub async fn install(
     // 3. 收集任务
     let mut tasks: Vec<Task> = Vec::new();
 
+    // 3a. client.jar
     if let Some(dl) = &version.downloads {
         if let Some(client) = &dl.client {
             tasks.push(Task {
@@ -58,17 +71,23 @@ pub async fn install(
         }
     }
 
+    // 3b. libraries
     let libs = collect_libraries(&version.libraries, &mirror.maven);
-    println!("libraries 待下载: {} 项", libs.len());
+    send(Msg::Log(format!("libraries 待下载: {} 项", libs.len())));
     for lib in libs {
         tasks.push(Task {
             url: mirror.rewrite(&lib.url),
             dest: base_dir.join("libraries").join(&lib.rel_path),
-            sha1: if lib.sha1.is_empty() { None } else { Some(lib.sha1) },
+            sha1: if lib.sha1.is_empty() {
+                None
+            } else {
+                Some(lib.sha1)
+            },
             label: lib.label,
         });
     }
 
+    // 3c. asset index + objects
     if let Some(idx_ref) = &version.asset_index {
         let idx_url = mirror.rewrite(&idx_ref.url);
         let idx_dest = base_dir
@@ -81,7 +100,7 @@ pub async fn install(
 
         let index = AssetIndex::from_slice(&idx_bytes)?;
         let unique = index.unique_objects();
-        println!("assets 待下载: {} 个对象", unique.len());
+        send(Msg::Log(format!("assets 待下载: {} 个对象", unique.len())));
         for obj in unique {
             let h2 = &obj.hash[..2];
             let dest = base_dir
@@ -101,64 +120,67 @@ pub async fn install(
 
     // 4. 并发下载
     let total = tasks.len();
-    println!(
+    send(Msg::Log(format!(
         "开始下载，共 {} 个文件，全局并发 {}，分块阈值 {} MB，块大小 {} MB",
         total,
         concurrency,
         seg_threshold / (1024 * 1024),
         chunk_size / (1024 * 1024)
-    );
+    )));
+    send(Msg::FileProgress {
+        current: 0,
+        total,
+        label: "准备中".into(),
+    });
 
-    let pb = Arc::new(ProgressBar::new(total as u64));
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) {msg}",
-        )
-        .unwrap()
-        .progress_chars("=> "),
-    );
-    pb.set_message("准备中");
+    let dl = Downloader::new(concurrency, true).with_chunking(chunk_size, seg_threshold);
 
-    let dl = Downloader::new(concurrency, true)
-        .with_progress(pb.clone())
-        .with_chunking(chunk_size, seg_threshold);
+    let errors = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let done = Arc::new(AtomicUsize::new(0));
 
-    let errors: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let mut handles = Vec::with_capacity(total);
     for task in tasks {
         let dl = dl.clone();
-        let pb = pb.clone();
+        let tx = tx.clone();
         let errors = errors.clone();
+        let done = done.clone();
         handles.push(tokio::spawn(async move {
-            pb.set_message(task.label.clone());
             let expected = task.sha1.as_ref().map(|h| ExpectedHash {
                 algo: HashAlgo::Sha1,
                 hex: h.clone(),
             });
+            let label = task.label.clone();
             if let Err(e) = dl.download(&task.url, &task.dest, expected).await {
                 errors.lock().await.push((task.label, format!("{e:#}")));
+            }
+            let cur = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(t) = &tx {
+                let _ = t.send(Msg::FileProgress {
+                    current: cur,
+                    total,
+                    label,
+                });
             }
         }));
     }
     for h in handles {
-        h.await?;
+        let _ = h.await;
     }
-    pb.finish_with_message("完成");
 
     // 5. 汇总
     let errors = errors.lock().await;
     if errors.is_empty() {
-        println!("✓ 安装完成");
+        send(Msg::Log("✓ 安装完成".into()));
         Ok(())
     } else {
-        println!("✗ {} 个文件下载失败:", errors.len());
+        send(Msg::Log(format!("✗ {} 个文件下载失败:", errors.len())));
         for (label, err) in errors.iter().take(20) {
-            println!("  - {}: {}", label, err);
+            send(Msg::Log(format!("  - {label}: {err}")));
         }
         if errors.len() > 20 {
-            println!("  ...（省略 {} 条）", errors.len() - 20);
+            send(Msg::Log(format!("  ...（省略 {} 条）", errors.len() - 20)));
         }
-        anyhow::bail!("安装未完整")
+        Err(anyhow::anyhow!("{} 个文件下载失败", errors.len()))
     }
 }
 
